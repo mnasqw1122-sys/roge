@@ -43,13 +43,13 @@ local BOSS_LOOT = {
     },
     daywalker = {
         { prefab = "voidclothhat", weight = 35 },
-        { prefab = "armorvoid", weight = 35 },
+        { prefab = "armor_voidcloth", weight = 35 },
         { prefab = "dreadstonehat", weight = 30 },
     },
     daywalker2 = {
         { prefab = "dreadstonehat", weight = 35 },
         { prefab = "armordreadstone", weight = 35 },
-        { prefab = "armorvoid", weight = 30 },
+        { prefab = "armor_voidcloth", weight = 30 },
     },
     alterguardian = {
         { prefab = "opalstaff", weight = 35 },

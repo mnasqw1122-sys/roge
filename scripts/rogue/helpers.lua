@@ -68,6 +68,54 @@ function M.RollRange(range)
     return range.min + math.random() * (range.max - range.min)
 end
 
+-- 基于天数和盐值创建确定性 PRNG 实例，不污染全局 math.random 状态
+function M.CreateDailyPRNG(day, salt)
+    local seed = (day or 1) * 10000 + (salt or 0)
+    return PRNG_Uniform(seed)
+end
+
+-- 使用 PRNG 实例从带权池中选取一个条目（不修改池子）
+function M.PickWeightedWithPRNG(prng, pool)
+    if not pool or #pool == 0 then return nil end
+    local total_weight = 0
+    for _, item in ipairs(pool) do
+        total_weight = total_weight + (item.weight or 10)
+    end
+    if total_weight <= 0 then return pool[#pool] end
+    local roll = prng:Rand() * total_weight
+    local current = 0
+    for _, item in ipairs(pool) do
+        current = current + (item.weight or 10)
+        if roll <= current then
+            return item
+        end
+    end
+    return pool[#pool]
+end
+
+-- 使用 PRNG 实例从带权池中选取 N 个不重复条目
+function M.PickNWeightedWithPRNG(prng, pool, n)
+    if not pool or #pool == 0 or n <= 0 then return {} end
+    local remaining = {}
+    for _, v in ipairs(pool) do
+        table.insert(remaining, v)
+    end
+    local result = {}
+    for _ = 1, n do
+        if #remaining == 0 then break end
+        local picked = M.PickWeightedWithPRNG(prng, remaining)
+        if not picked then break end
+        table.insert(result, picked)
+        for i, v in ipairs(remaining) do
+            if v == picked then
+                table.remove(remaining, i)
+                break
+            end
+        end
+    end
+    return result
+end
+
 -- 获取实体的本地化显示名称，如果没有则回退到 prefab 名字
 function M.GetEntityName(ent)
     if not ent or not ent.prefab then return "未知目标" end
@@ -77,6 +125,37 @@ function M.GetEntityName(ent)
     end
     if ent.name and ent.name ~= "" then return ent.name end
     return ent.prefab
+end
+
+-- 函数说明：安全调用SpawnPrefab，出错时返回nil并打印日志
+function M.SafeSpawnPrefab(name, skin, skin_id, creator)
+    local ok, inst = pcall(SpawnPrefab, name, skin, skin_id, creator)
+    if not ok then
+        print("[RogueMode] SafeSpawnPrefab failed for '" .. tostring(name) .. "': " .. tostring(inst))
+        return nil
+    end
+    return inst
+end
+
+-- 函数说明：安全执行函数，出错时返回默认值并打印日志
+function M.SafeCall(fn, err_return, ...)
+    if type(fn) ~= "function" then return err_return end
+    local ok, result = pcall(fn, ...)
+    if not ok then
+        print("[RogueMode] SafeCall error: " .. tostring(result))
+        return err_return
+    end
+    return result
+end
+
+-- 函数说明：安全查找实体，出错时返回空表
+function M.SafeFindEntities(x, y, z, radius, must_tags, cant_tags, must_one_tags)
+    local ok, results = pcall(TheSim.FindEntities, TheSim, x, y, z, radius, must_tags, cant_tags, must_one_tags)
+    if not ok then
+        print("[RogueMode] SafeFindEntities error: " .. tostring(results))
+        return {}
+    end
+    return results or {}
 end
 
 return M

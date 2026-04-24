@@ -1,13 +1,19 @@
 --[[
     文件说明：runtime_system.lua
-    功能：肉鸽模式的运行时生命周期管理器。
-    负责监听和拦截原版游戏的保存/加载机制（持久化玩家与世界状态）、玩家生成、世界阶段（昼夜）变化以及击杀事件，
-    从而驱动波次系统、掉落系统和赛季系统的运转。
+    功能：肉鸽模式的运行时生命周期管理器（精简版）。
+    引导层模块已拆分至 bootstrap/ (module_loader / hook_registry / lifecycle)，
+    本文件负责核心内核：持久化钩子、玩家/世界生命周期、击杀/天变事件路由分发。
 ]]
 local M = {}
 
+local Logger = require("rogue/logger")
+local EventBus = require("rogue/event_bus")
+
 function M.Create(deps)
     local S = {}
+
+    -- 注入事件总线，使 deps 可通过 deps.EventBus 访问
+    deps.EventBus = EventBus
 
     local function DeepCopy(src, seen)
         if type(src) ~= "table" then
@@ -64,7 +70,28 @@ function M.Create(deps)
                     self.rogue_init = data.rogue_init_given == true or legacy_init
                     self.rogue_applied_hp_bonus = 0
                     self:DoTaskInTime(0, function()
-                        deps.ApplyGrowthState(self, self.rogue_data, true)
+                        local ok_apply, err_apply = pcall(deps.ApplyGrowthState, self, self.rogue_data, true)
+                        if not ok_apply then
+                            print("[RogueMode] ApplyGrowthState error on load:", err_apply)
+                        end
+                        if deps.ReapplyTalentEffects then
+                            local ok_talent, err_talent = pcall(deps.ReapplyTalentEffects, self)
+                            if not ok_talent then
+                                print("[RogueMode] ReapplyTalentEffects error on load:", err_talent)
+                            end
+                        end
+                        if deps.RegisterSetBonusWatcher then
+                            local ok_watcher, err_watcher = pcall(deps.RegisterSetBonusWatcher, self)
+                            if not ok_watcher then
+                                print("[RogueMode] RegisterSetBonusWatcher error on load:", err_watcher)
+                            end
+                        end
+                        if deps.RefreshSetBonuses then
+                            local ok_set, err_set = pcall(deps.RefreshSetBonuses, self)
+                            if not ok_set then
+                                print("[RogueMode] RefreshSetBonuses error on load:", err_set)
+                            end
+                        end
                     end)
                 end
                 if data.rogue_starter_items then self.rogue_starter_items = data.rogue_starter_items end
@@ -176,10 +203,18 @@ function M.Create(deps)
                         deps.OnSeasonKill(doer, victim, is_boss, day)
 
                         -- 积分系统接入贪婪契约：只有拥有贪婪标签的玩家才能通过击杀获取积分
+                        -- 优化：积分曲线平滑化，随天数增长——解决前期不足后期过剩问题
+                        -- 小怪: min(5, 2+day/10)  Boss: 20+day*2  精英: min(10, 3+day/5)
                         local has_greed = doer:HasTag("rogue_greed_pact")
                         if has_greed then
-                            -- 贪婪契约赋予击杀积分能力：小怪 1 点、精英 2 点、Boss 5 点
-                            local point_gain = is_boss and 5 or (victim:HasTag("rogue_elite") and 2 or 1)
+                            local point_gain
+                            if is_boss then
+                                point_gain = math.floor(20 + day * 2)
+                            elseif victim:HasTag("rogue_elite") then
+                                point_gain = math.min(10, math.floor(3 + day / 5))
+                            else
+                                point_gain = math.min(5, math.floor(2 + day / 10))
+                            end
                             
                             local d_state = deps.EnsurePlayerData(doer)
                             d_state.points = (d_state.points or 0) + point_gain
@@ -190,9 +225,15 @@ function M.Create(deps)
 
                         deps.DropLoot(victim, is_boss, day, doer)
                         deps.RefreshComboState(doer)
+                        if deps.CheckAchievement then
+                            local d = deps.EnsurePlayerData(doer)
+                            if d.combo_count and d.combo_count >= 5 then
+                                deps.CheckAchievement(doer, "combo", d.combo_count)
+                            end
+                        end
                         deps.ProgressDailyTaskOnKill(doer, victim, is_boss, day)
                         local ws = deps.GetWaveState()
-                        if ws.challenge and not ws.challenge.completed then
+                        if ws and ws.challenge and not ws.challenge.completed then
                             deps.ProgressChallenge(1, 1, day)
                             if victim:HasTag("rogue_elite") then
                                 deps.ProgressChallenge(2, 1, day)
@@ -201,7 +242,7 @@ function M.Create(deps)
                                 deps.ProgressChallenge(3, 1, day)
                             end
                         end
-                        if ws.bounty and not ws.bounty.completed and victim:HasTag("rogue_bounty_target") then
+                        if ws and ws.bounty and not ws.bounty.completed and victim:HasTag("rogue_bounty_target") then
                             ws.bounty.killed = (ws.bounty.killed or 0) + 1
                             if ws.bounty.killed >= (ws.bounty.target or 1) then
                                 ws.bounty.completed = true
@@ -210,8 +251,28 @@ function M.Create(deps)
                             deps.SyncWaveStateToAllPlayers()
                         end
 
+                        -- 通过事件总线广播击杀，各子系统独立消费
+                        EventBus.Emit("on_kill", {
+                            killer = doer,
+                            victim = victim,
+                            is_boss = is_boss,
+                            day = day,
+                        })
+
                         if is_boss then
                             deps.ApplyBuff(doer, true)
+                            if deps.CheckAchievement then
+                                deps.CheckAchievement(doer, "boss_kill", 1)
+                                deps.CheckAchievement(doer, "kill", 1)
+                            end
+                            if deps.TriggerChainEvent then
+                                deps.TriggerChainEvent(doer, "boss_kill")
+                            end
+                            EventBus.Emit("on_boss_kill", {
+                                killer = doer,
+                                boss = victim,
+                                day = day,
+                            })
                         else
                             local d = deps.EnsurePlayerData(doer)
                             d.kills = d.kills + 1
@@ -219,6 +280,15 @@ function M.Create(deps)
                             deps.CheckTalentTrigger(doer)
                             deps.CheckRelicTrigger(doer, day)
                             if d.kills % deps.CONST.BUFF_KILL_INTERVAL == 0 then deps.ApplyBuff(doer, false) end
+                            if deps.CheckAchievement then
+                                deps.CheckAchievement(doer, "kill", 1)
+                                if victim:HasTag("rogue_elite") then
+                                    deps.CheckAchievement(doer, "elite_kill", 1)
+                                    if deps.TriggerChainEvent then
+                                        deps.TriggerChainEvent(doer, "elite_kill")
+                                    end
+                                end
+                            end
                         end
                     end)
                 end
@@ -244,6 +314,8 @@ function M.Create(deps)
                         end
                     end
                     deps.SyncSeasonStateToAllPlayers()
+                    -- 广播天数变化事件
+                    EventBus.Emit("on_day_changed", { new_day = day, old_day = day - 1 })
                     if not deps.CanRunCombatLoop() then return end
                     if deps.IsGracePeriod and deps.IsGracePeriod(day) then
                         if world.rogue_grace_announce_day ~= day then
@@ -299,24 +371,45 @@ function M.Create(deps)
                                 local players = deps.CollectAlivePlayers()
                                 if #players == 0 then return end
                                 local radius = deps.Config.GROUND_LOOT_CLEAN_SEARCH_RADIUS or 70
-                                local max_clean = deps.Config.GROUND_LOOT_CLEAN_BATCH_SIZE or 60
-                                local count = 0
-                                
-                                for _, p in ipairs(players) do
-                                    if count >= max_clean then break end
+                                local batch_size = deps.Config.GROUND_LOOT_CLEAN_BATCH_SIZE or 60
+                                local player_idx = 1
+                                local total_cleaned = 0
+
+                                -- 分帧批处理：每帧处理batch_size个物品，避免单帧卡顿
+                                local function clean_step()
+                                    if player_idx > #players then
+                                        if total_cleaned > 0 then
+                                            deps.Announce("夜间清理：移除了 " .. total_cleaned .. " 个地面物品。")
+                                        end
+                                        return
+                                    end
+                                    local p = players[player_idx]
+                                    if not p or not p:IsValid() then
+                                        player_idx = player_idx + 1
+                                        clean_step()
+                                        return
+                                    end
                                     local pt = p:GetPosition()
-                                    -- 使用 TheSim:FindEntities 替代遍历 GLOBAL.Ents，大幅提升性能
-                                    local ents = deps.GLOBAL.TheSim:FindEntities(pt.x, pt.y, pt.z, radius, {"_inventoryitem"}, {"INLIMBO", "irreplaceable", "rogue_supply_protected", "player", "companion"})
+                                    local ents = deps.GLOBAL.TheSim:FindEntities(
+                                        pt.x, pt.y, pt.z, radius,
+                                        {"_inventoryitem"},
+                                        {"INLIMBO", "irreplaceable", "rogue_supply_protected", "player", "companion"}
+                                    )
+                                    local cleaned_this_batch = 0
                                     for _, v in ipairs(ents) do
-                                        if count >= max_clean then break end
-                                        if v:IsValid() and not v.components.inventoryitem:GetGrandOwner() then
+                                        if cleaned_this_batch >= batch_size then break end
+                                        if v:IsValid() and v.components.inventoryitem
+                                           and not v.components.inventoryitem:GetGrandOwner() then
                                             v:Remove()
-                                            count = count + 1
+                                            cleaned_this_batch = cleaned_this_batch + 1
+                                            total_cleaned = total_cleaned + 1
                                         end
                                     end
+                                    player_idx = player_idx + 1
+                                    -- 下一帧继续
+                                    world:DoTaskInTime(0, clean_step)
                                 end
-                                
-                                if count > 0 then deps.Announce("夜间清理：移除了 " .. count .. " 个地面物品。") end
+                                clean_step()
                             end)
                         end
                     end

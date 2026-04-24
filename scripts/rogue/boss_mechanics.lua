@@ -35,18 +35,27 @@ function M.Create(deps)
         return count > 0 and count or 1
     end
 
-    local function GetPlayerScale()
+    -- 获取玩家数量分级的 Boss 技能伤害缩放系数
+    -- 优化：从旧版 0.88/1.0/1.12/1.22 升级为更显著的多人难度弹性曲线
+    local function GetPlayerDamageScale()
         local count = GetPlayerCount()
-        if count <= 1 then
-            return 0.88
-        elseif count == 2 then
-            return 1.0
-        elseif count == 3 then
-            return 1.12
-        elseif count == 4 then
-            return 1.22
+        if count <= 1 then return 1.0
+        elseif count == 2 then return 1.15
+        elseif count == 3 then return 1.25
+        elseif count == 4 then return 1.35
         end
-        return 1.3
+        return 1.40
+    end
+
+    -- 获取玩家数量分级的 Boss HP 缩放系数(供 wave_system 生成 Boss 时使用)
+    local function GetPlayerHPScale()
+        local count = GetPlayerCount()
+        if count <= 1 then return 1.0
+        elseif count == 2 then return 1.6
+        elseif count == 3 then return 2.2
+        elseif count == 4 then return 2.8
+        end
+        return 3.3
     end
 
     local function GetTargetCount(base, max_count)
@@ -254,7 +263,7 @@ function M.Create(deps)
     local function GetSkillDamage(inst, factor, min_damage, max_damage)
         local runtime = EnsureBossRuntime(inst)
         local base = runtime.base_damage or (inst.components and inst.components.combat and inst.components.combat.defaultdamage) or 45
-        local damage = base * (factor or 0.4) * GetPlayerScale() * (1 + (GetThreatTier() - 1) * 0.08)
+        local damage = base * (factor or 0.4) * GetPlayerDamageScale() * (1 + (GetThreatTier() - 1) * 0.08)
         if min_damage and damage < min_damage then
             damage = min_damage
         end
@@ -635,6 +644,57 @@ function M.Create(deps)
     S.AttachBossTemplate = function(inst, day)
         if not inst or not inst:IsValid() or inst.rogue_boss_template_id then return nil end
         EnsureBossRuntime(inst)
+        
+        -- [V2 深度机制集成]
+        if deps and deps.RogueBossMechanicsV2 then
+            -- 如果是熊獾，有 25% 概率变异为 V2 领域工匠机制
+            if inst.prefab == "bearger" and math.random() < 0.25 then
+                local success = deps.RogueBossMechanicsV2.ApplyDeepAffix(inst, "arena_forge_bearger", deps)
+                if success then
+                    inst.rogue_boss_template_id = "arena_forge_bearger"
+                    inst.rogue_boss_template_name = "领域工匠"
+                    return { id = "arena_forge_bearger", name = "领域工匠" }
+                end
+            end
+            -- 如果是树精守卫，有 25% 概率变异为 V2 统御军势机制
+            if (inst.prefab == "leif" or inst.prefab == "treeguard") and math.random() < 0.25 then
+                local success = deps.RogueBossMechanicsV2.ApplyDeepAffix(inst, "summoner_legion_treeguard", deps)
+                if success then
+                    inst.rogue_boss_template_id = "summoner_legion_treeguard"
+                    inst.rogue_boss_template_name = "统御军势"
+                    return { id = "summoner_legion_treeguard", name = "统御军势" }
+                end
+            end
+            -- 如果是鹿角鹅，有 25% 概率变异为 V2 雷暴猎场机制
+            if inst.prefab == "moose" and math.random() < 0.25 then
+                local success = deps.RogueBossMechanicsV2.ApplyDeepAffix(inst, "thunder_hunt_moose", deps)
+                if success then
+                    inst.rogue_boss_template_id = "thunder_hunt_moose"
+                    inst.rogue_boss_template_name = "雷暴猎场"
+                    return { id = "thunder_hunt_moose", name = "雷暴猎场" }
+                end
+            end
+            -- 如果是蜘蛛女王，有 25% 概率变异为 V2 双相裂变机制
+            if inst.prefab == "spiderqueen" and math.random() < 0.25 then
+                local success = deps.RogueBossMechanicsV2.ApplyDeepAffix(inst, "phase_shift_spiderqueen", deps)
+                if success then
+                    inst.rogue_boss_template_id = "phase_shift_spiderqueen"
+                    inst.rogue_boss_template_name = "双相裂变"
+                    return { id = "phase_shift_spiderqueen", name = "双相裂变" }
+                end
+            end
+            -- 如果是远古犀牛，有 25% 概率变异为 V2 压迫领域机制
+            if inst.prefab == "minotaur" and math.random() < 0.25 then
+                local success = deps.RogueBossMechanicsV2.ApplyDeepAffix(inst, "oppressive_domain_minotaur", deps)
+                if success then
+                    inst.rogue_boss_template_id = "oppressive_domain_minotaur"
+                    inst.rogue_boss_template_name = "压迫领域"
+                    return { id = "oppressive_domain_minotaur", name = "压迫领域" }
+                end
+            end
+        end
+        
+        -- [回退到 V1 机制]
         local template = PickTemplate(day)
         if not template then return nil end
         

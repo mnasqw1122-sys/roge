@@ -5,6 +5,138 @@
 ]]
 local M = {}
 local StateSchema = require("rogue/state_schema")
+local RogueConfig = require("rogue/config")
+
+-- 函数说明：根据构筑评分返回流派等级名称
+local function GetBuildTier(score)
+    if score >= 120 then return "神话" end
+    if score >= 80 then return "传说" end
+    if score >= 45 then return "史诗" end
+    if score >= 20 then return "精良" end
+    return "普通"
+end
+
+-- 函数说明：生成加成摘要文本，供客户端"加成"标签页显示
+local function BuildBonusSummaryText(data)
+    if not data then return "" end
+    local lines = {}
+
+    local function Pct(v) return math.floor((v or 0) * 100 + 0.5) end
+
+    local atk = {}
+    if (data.damage_bonus or 0) > 0 then atk[#atk+1] = string.format("伤害+%d%%", Pct(data.damage_bonus)) end
+    if (data.talent_crit_chance or 0) > 0 then atk[#atk+1] = string.format("暴击%d%%x%.1f", Pct(data.talent_crit_chance), data.talent_crit_dmg_mult or 1) end
+    if (data.crit_chance or 0) > 0 then atk[#atk+1] = string.format("暴击%d%%", Pct(data.crit_chance)) end
+    if (data.crit_dmg_mult or 1) > 1 then atk[#atk+1] = string.format("暴伤x%.1f", data.crit_dmg_mult) end
+    if (data.talent_armor_pen or 0) > 0 then atk[#atk+1] = string.format("穿甲%d%%", Pct(data.talent_armor_pen)) end
+    if (data.lifesteal_chance or 0) > 0 then atk[#atk+1] = string.format("虹吸%d%%(+%d)", Pct(data.lifesteal_chance), data.lifesteal_amount or 0) end
+    if (data.elemental_bonus or 0) > 0 then atk[#atk+1] = string.format("元素+%d%%", Pct(data.elemental_bonus)) end
+    if #atk > 0 then lines[#lines+1] = "═══攻击═══"; lines[#lines+1] = table.concat(atk, " ") end
+
+    local def = {}
+    if (data.hp_bonus or 0) > 0 then def[#def+1] = string.format("生命+%d", data.hp_bonus) end
+    if (data.relic_damage_reduction or 0) > 0 then def[#def+1] = string.format("减伤%d%%", Pct(data.relic_damage_reduction)) end
+    if (data.death_defy_chance or 0) > 0 then def[#def+1] = string.format("免死%d%%", Pct(data.death_defy_chance)) end
+    if (data.elemental_resist or 0) > 0 then def[#def+1] = string.format("元素抗+%d%%", Pct(data.elemental_resist)) end
+    if #def > 0 then lines[#lines+1] = "═══防御═══"; lines[#lines+1] = table.concat(def, " ") end
+
+    local util = {}
+    if (data.drop_bonus or 0) > 0 then util[#util+1] = string.format("掉落+%d%%", Pct(data.drop_bonus)) end
+    if (data.speed_bonus or 0) > 0 then util[#util+1] = string.format("速度+%d%%", Pct(data.speed_bonus)) end
+    if (data.luck_bonus or 0) > 0 then util[#util+1] = string.format("幸运+%d%%", Pct(data.luck_bonus)) end
+    if (data.cooldown_reduction or 0) > 0 then util[#util+1] = string.format("冷却-%d%%", Pct(data.cooldown_reduction)) end
+    if (data.combo_window_bonus or 0) > 0 then util[#util+1] = string.format("连杀窗+%.1fs", data.combo_window_bonus) end
+    if (data.daily_reward_bonus or 0) > 0 then util[#util+1] = string.format("日常奖+%d%%", Pct(data.daily_reward_bonus)) end
+    if #util > 0 then lines[#lines+1] = "═══辅助═══"; lines[#lines+1] = table.concat(util, " ") end
+
+    local reg = {}
+    if (data.talent_regen or 0) > 0 then reg[#reg+1] = string.format("回血+%.1f/3s", data.talent_regen) end
+    if (data.regen_bonus or 0) > 0 then reg[#reg+1] = string.format("回血+%.1f/s", data.regen_bonus) end
+    if (data.sanity_regen_bonus or 0) > 0 then reg[#reg+1] = string.format("回理智+%.1f/s", data.sanity_regen_bonus) end
+    if #reg > 0 then lines[#lines+1] = "═══恢复═══"; lines[#lines+1] = table.concat(reg, " ") end
+
+    if data.talent_levels and next(data.talent_levels) then
+        local td = RogueConfig.TALENT_DEFS or {}
+        local parts = {}
+        for id, level in pairs(data.talent_levels) do
+            for _, t in ipairs(td) do
+                if t.id == id then
+                    parts[#parts+1] = string.format("%sLv%d", t.name or "?", level)
+                    break
+                end
+            end
+        end
+        if #parts > 0 then lines[#lines+1] = "═══天赋═══"; lines[#lines+1] = table.concat(parts, " ") end
+    end
+
+    if data.relics and #data.relics > 0 then
+        local rd = RogueConfig.RELIC_DEFS or {}
+        local parts = {}
+        for _, rid in ipairs(data.relics) do
+            for _, r in ipairs(rd) do
+                if r.id == rid then
+                    parts[#parts+1] = r.name or "?"
+                    break
+                end
+            end
+        end
+        if #parts > 0 then lines[#lines+1] = "═══遗物═══"; lines[#lines+1] = table.concat(parts, " ") end
+    end
+
+    if data.relic_synergy_applied then
+        local sd = RogueConfig.RELIC_SYNERGY_DEFS or {}
+        local parts = {}
+        if type(data.relic_synergy_applied) == "table" then
+            for _, key in ipairs(data.relic_synergy_applied) do
+                for _, s in ipairs(sd) do
+                    if s.key == key or s.id == key then
+                        parts[#parts+1] = s.name or tostring(key)
+                        break
+                    end
+                end
+            end
+        end
+        if #parts > 0 then lines[#lines+1] = "协同:" .. table.concat(parts, "、") end
+    end
+
+    if data.set_bonuses_applied and next(data.set_bonuses_applied) then
+        local sd = RogueConfig.SET_BONUS_DEFS or {}
+        local parts = {}
+        for set_id, val in pairs(data.set_bonuses_applied) do
+            local cnt = type(val) == "number" and val or 1
+            for _, s in ipairs(sd) do
+                if s.id == set_id then
+                    local max_th = s.threshold and s.threshold[#s.threshold] or 4
+                    parts[#parts+1] = string.format("%s%d/%d", s.name or "?", cnt, max_th)
+                    break
+                end
+            end
+        end
+        if #parts > 0 then lines[#lines+1] = "═══套装═══"; lines[#lines+1] = table.concat(parts, " ") end
+    end
+
+    if data.relic_builds and next(data.relic_builds) then
+        local bd = RogueConfig.RELIC_BUILD_DEFS or {}
+        local parts = {}
+        for build_key, active in pairs(data.relic_builds) do
+            if active then
+                for _, b in ipairs(bd) do
+                    if b.key == build_key then
+                        parts[#parts+1] = b.name or build_key
+                        break
+                    end
+                end
+            end
+        end
+        if #parts > 0 then lines[#lines+1] = "═══构筑═══"; lines[#lines+1] = table.concat(parts, "、") end
+    end
+
+    if (data.build_score or 0) > 0 then
+        lines[#lines+1] = string.format("构筑:%s(%d)", GetBuildTier(data.build_score), data.build_score)
+    end
+
+    return #lines > 0 and table.concat(lines, "\n") or "暂无加成"
+end
 
 function M.Create(deps)
     local state = {}
@@ -23,6 +155,22 @@ function M.Create(deps)
         d.drop_bonus = d.drop_bonus or 0
         d.daily_reward_bonus = d.daily_reward_bonus or 0
         d.talent_pick_count = d.talent_pick_count or 0
+        if not d.talent_levels then d.talent_levels = {} end
+        d.elemental_bonus = d.elemental_bonus or 0
+        d.elemental_resist = d.elemental_resist or 0
+        d.speed_bonus = d.speed_bonus or 0
+        d.lifesteal_chance = d.lifesteal_chance or 0
+        d.lifesteal_amount = d.lifesteal_amount or 0
+        d.luck_bonus = d.luck_bonus or 0
+        d.cooldown_reduction = d.cooldown_reduction or 0
+        if not d.achievements then d.achievements = {} end
+        if not d.achievement_progress then d.achievement_progress = {} end
+        if not d.set_bonuses_applied then d.set_bonuses_applied = {} end
+        d.set_damage_bonus = d.set_damage_bonus or 0
+        d.set_combo_window = d.set_combo_window or 0
+        d.set_sanity_regen_bonus = d.set_sanity_regen_bonus or 0
+        d.set_ignite_chance = d.set_ignite_chance or 0
+        d.set_shadow_dmg_bonus = d.set_shadow_dmg_bonus or 0
         d.talent_pending = d.talent_pending == true
         d.supply_pending = d.supply_pending == true
         d.relic_pending = d.relic_pending == true
@@ -60,9 +208,6 @@ function M.Create(deps)
         d.bounty_active = d.bounty_active == true
         d.bounty_progress = d.bounty_progress or 0
         d.bounty_target = d.bounty_target or 0
-        d.catastrophe_active = d.catastrophe_active == true
-        d.catastrophe_id = d.catastrophe_id or 0
-        d.catastrophe_tier = d.catastrophe_tier or 0
         d.challenge_active = d.challenge_active == true
         d.challenge_progress = d.challenge_progress or 0
         d.challenge_target = d.challenge_target or 0
@@ -134,13 +279,14 @@ function M.Create(deps)
             data["season_hist" .. i .. "_deaths"] = e.deaths or 0
             data["season_hist" .. i .. "_build"] = e.build_score or 0
             data["season_hist" .. i .. "_route"] = e.route_id or 0
-            data["season_hist" .. i .. "_catastrophe_days"] = e.catastrophe_days or 0
             data["season_hist" .. i .. "_challenge_done"] = e.challenge_done or 0
             data["season_hist" .. i .. "_challenge_total"] = e.challenge_total or 0
             data["season_hist" .. i .. "_bounty_done"] = e.bounty_done or 0
             data["season_hist" .. i .. "_bounty_total"] = e.bounty_total or 0
             data["season_hist" .. i .. "_style"] = e.style_id or 0
         end
+
+        data.bonus_text = BuildBonusSummaryText(data)
 
         StateSchema.SyncToNetvars(player, data)
     end

@@ -6,7 +6,7 @@
 name = "肉鸽生存模式"
 description = "一个肉鸽挑战模式，玩家将在一个资源匮乏的小岛上抵御一波又一波的敌人。"
 author = "liuan"
-version = "1.5.16"
+version = "2.1.1"
 forumthread = ""
 api_version = 10
 dst_compatible = true
@@ -14,6 +14,9 @@ dont_starve_compatible = false
 all_clients_require_mod = true
 client_only_mod = false
 server_filter_tags = {"roguelike", "survival", "challenge"}
+
+icon_atlas = "modicon.xml"
+icon = "modicon.tex"
 
 configuration_options = {
     -- [基础设置]
@@ -282,5 +285,17 @@ configuration_options = {
             {description = "100", data = 100},
         },
         default = 70,
+    },
+    
+    -- [AI NPC]
+    {
+        name = "AI_NPC_ENABLED",
+        label = "AI小人挑战",
+        hover = "是否在休息天生成具有独立AI和装备的挑战型小人。",
+        options = {
+            {description = "开启", data = true},
+            {description = "关闭", data = false},
+        },
+        default = true,
     },
 }

@@ -13,6 +13,19 @@ local TheNet = GLOBAL.TheNet
 local FindWalkableOffset = GLOBAL.FindWalkableOffset
 local AllPlayers = GLOBAL.AllPlayers
 local IsServer = GLOBAL.TheNet:GetIsServer()
+
+PrefabFiles = {
+    "rogue_recycle_bin",
+    "rogue_npc",
+}
+
+Assets = {
+    Asset("IMAGE", "images/rogue_icon.tex"),
+    Asset("ATLAS", "images/rogue_icon.xml"),
+    Asset("IMAGE", "images/rogue_panel.tex"),
+    Asset("ATLAS", "images/rogue_panel.xml"),
+}
+
 local RogueConfig = require("rogue/config")
 local RogueHelpers = require("rogue/helpers")
 local RoguePlayerState = require("rogue/player_state")
@@ -24,12 +37,21 @@ local RogueProgressionSystem = require("rogue/progression_system")
 local RogueAffixSystem = require("rogue/affix_system")
 local RogueRuntimeSystem = require("rogue/runtime_system")
 local RogueBossMechanics = require("rogue/boss_mechanics")
+local RogueBossMechanicsV2 = require("rogue/boss_mechanics_v2") -- 引入 V2 深度机制引擎
+local AffixArenaForge = require("rogue/affix_arena_forge") -- 引入 V2 领域工匠词缀
+local AffixSummonerLegion = require("rogue/affix_summoner_legion") -- 引入 V2 统御军势/雷暴猎场/双相裂变/压迫领域词缀
 local RogueBossLoot = require("rogue/boss_loot")
 local RogueRelicSystem = require("rogue/relic_system")
 local RogueSeasonSystem = require("rogue/season_system")
 local RogueSeasonResult = require("rogue/season_result")
 local RogueStateSchema = require("rogue/state_schema")
 local RogueShopSystem = require("rogue/shop_system")
+local RogueSetBonus = require("rogue/set_bonus")
+local RogueChainEvent = require("rogue/chain_event")
+local RogueAchievement = require("rogue/achievement_system")
+local RogueCoopSystem = require("rogue/coop_system")
+local RogueMilestoneSystem = require("rogue/milestone_system")
+local RogueConfigHotreload = require("rogue/config_hotreload")
 local Config = RogueConfig.LoadConfig(function(key)
     return GetModConfigData(key)
 end)
@@ -47,13 +69,10 @@ local wave_state = nil
 AddClassPostConstruct("widgets/controls", function(self)
     if self.owner then
         local RogueStatusDisplay = require("widgets/rogue_status_display")
-        self.rogue_status = self:AddChild(RogueStatusDisplay(self.owner))
-        -- 确保 UI 位于顶层，避免被其他 UI 遮挡
+        -- 挂载到 topright_root 缩放节点，自动参与 HUD 缩放系统
+        local mount_root = self.topright_root or self
+        self.rogue_status = mount_root:AddChild(RogueStatusDisplay(self.owner))
         self.rogue_status:MoveToFront()
-        -- 设置对齐和位置，放到右上角避免与左侧制作栏重叠
-        self.rogue_status:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
-        self.rogue_status:SetVAnchor(GLOBAL.ANCHOR_TOP)
-        self.rogue_status:SetPosition(-320, -160, 0)
 
         local RogueShopPanel = require("widgets/rogue_shop_panel")
         self.rogue_shop = self:AddChild(RogueShopPanel(self.owner))
@@ -61,54 +80,120 @@ AddClassPostConstruct("widgets/controls", function(self)
         
         -- 给 status UI 传递 shop panel 的引用，方便开关
         self.rogue_status.shop_panel = self.rogue_shop
+
+        -- 遗物三选一弹窗面板
+        local RogueRelicPanel = require("widgets/rogue_relic_panel")
+        self.rogue_relic_panel = self:AddChild(RogueRelicPanel(self.owner))
+        self.rogue_relic_panel:Hide()
+
+        -- 天赋三选一弹窗面板
+        local RogueTalentPanel = require("widgets/rogue_talent_panel")
+        self.rogue_talent_panel = self:AddChild(RogueTalentPanel(self.owner))
+        self.rogue_talent_panel:Hide()
+
+        -- 补给三选一弹窗面板
+        local RogueSupplyPanel = require("widgets/rogue_supply_panel")
+        self.rogue_supply_panel = self:AddChild(RogueSupplyPanel(self.owner))
+        self.rogue_supply_panel:Hide()
+    end
+end)
+
+AddClassPostConstruct("widgets/containerwidget", function(self)
+    local old_Open = self.Open
+    self.Open = function(self, container, doer)
+        old_Open(self, container, doer)
+        if container and container.prefab == "rogue_recycle_bin" then
+            if self.bganim then self.bganim:Hide() end
+            if self.bgimage then self.bgimage:Hide() end
+            
+            -- 将该容器直接挂载到玩家的肉鸽商店回收界面
+            if doer and doer.HUD and doer.HUD.controls and doer.HUD.controls.rogue_shop then
+                local shop = doer.HUD.controls.rogue_shop
+                shop.recycle_container:AddChild(self)
+                self:SetPosition(0, 0, 0)
+                -- 修正缩放，保持 1:1，不再过度放大
+                self:SetScale(1, 1, 1)
+                shop.active_recycle_widget = self
+            end
+        end
+    end
+
+    local old_Close = self.Close
+    self.Close = function(self)
+        if self.container and self.container.prefab == "rogue_recycle_bin" then
+            if self.owner and self.owner.HUD and self.owner.HUD.controls and self.owner.HUD.controls.rogue_shop then
+                local shop = self.owner.HUD.controls.rogue_shop
+                if shop.active_recycle_widget == self then
+                    shop.active_recycle_widget = nil
+                end
+            end
+        end
+        old_Close(self)
     end
 end)
 
 -- [网络变量注册] --------------------------------------------------------------------
+local containers = require("containers")
+local params = containers.params
+
+local rogue_recycle_bin_slots = {}
+for y = 0, 2 do
+    for x = 0, 4 do
+        table.insert(rogue_recycle_bin_slots, GLOBAL.Vector3(-250 + x * 120, 60 - y * 90, 0))
+    end
+end
+
+params.rogue_recycle_bin = {
+    widget = {
+        slotpos = rogue_recycle_bin_slots,
+        animbank = "ui_chest_3x3",
+        animbuild = "ui_chest_3x3",
+        pos = GLOBAL.Vector3(0, 0, 0),
+        side_align_tip = 160,
+    },
+    type = "chest",
+    excludefromcrafting = true,
+}
+
+for k, v in pairs(params) do
+    containers.MAXITEMSLOTS = math.max(containers.MAXITEMSLOTS, v.widget.slotpos ~= nil and #v.widget.slotpos or 0)
+end
+
 AddPlayerPostInit(function(inst)
     RogueStateSchema.RegisterNetvars(inst, GLOBAL)
 end)
 
--- 处理玩家选择天赋的 RPC 请求
-AddModRPCHandler("rogue_mode", "pick_talent", function(player, slot)
-    if GLOBAL._rogue_mode_pick_talent_rpc then
-        GLOBAL._rogue_mode_pick_talent_rpc(player, slot)
-    end
-end)
+-- [RPC闭包注册] --------------------------------------------------------------------
+-- 使用本地handler表替代GLOBAL全局函数桥接，避免命名空间污染
+-- handler表在子系统初始化后填充，RPC回调通过闭包引用此表
+local _rpc_handlers = {}
 
--- 处理玩家选择补给的 RPC 请求
-AddModRPCHandler("rogue_mode", "pick_supply", function(player, slot)
-    if GLOBAL._rogue_mode_pick_supply_rpc then
-        GLOBAL._rogue_mode_pick_supply_rpc(player, slot)
-    end
-end)
+-- 函数说明：注册RPC处理器到本地表（替代GLOBAL._rogue_mode_*_rpc赋值）
+local function SetRPCHandler(name, fn)
+    _rpc_handlers[name] = fn
+end
 
--- 处理玩家选择遗物的 RPC 请求
-AddModRPCHandler("rogue_mode", "pick_relic", function(player, slot)
-    if GLOBAL._rogue_mode_pick_relic_rpc then
-        GLOBAL._rogue_mode_pick_relic_rpc(player, slot)
+-- 函数说明：创建RPC回调闭包（从本地表查找处理器）
+local function MakeRPCCallback(name)
+    return function(player, ...)
+        local handler = _rpc_handlers[name]
+        if handler then
+            handler(player, ...)
+        end
     end
-end)
+end
 
-AddModRPCHandler("rogue_mode", "pick_route", function(player, slot)
-    if GLOBAL._rogue_mode_pick_route_rpc then
-        GLOBAL._rogue_mode_pick_route_rpc(player, slot)
-    end
-end)
-
--- 处理玩家购买商店物品的 RPC 请求
-AddModRPCHandler("rogue_mode", "buy_shop_item", function(player, item_id)
-    if GLOBAL._rogue_mode_buy_shop_item_rpc then
-        GLOBAL._rogue_mode_buy_shop_item_rpc(player, item_id)
-    end
-end)
-
--- 处理玩家回收物品的 RPC 请求
-AddModRPCHandler("rogue_mode", "recycle_item", function(player, prefab)
-    if GLOBAL._rogue_mode_recycle_item_rpc then
-        GLOBAL._rogue_mode_recycle_item_rpc(player, prefab)
-    end
-end)
+AddModRPCHandler("rogue_mode", "pick_talent", MakeRPCCallback("pick_talent"))
+AddModRPCHandler("rogue_mode", "pick_supply", MakeRPCCallback("pick_supply"))
+AddModRPCHandler("rogue_mode", "pick_relic", MakeRPCCallback("pick_relic"))
+AddModRPCHandler("rogue_mode", "pick_route", MakeRPCCallback("pick_route"))
+AddModRPCHandler("rogue_mode", "buy_shop_item", MakeRPCCallback("buy_shop_item"))
+AddModRPCHandler("rogue_mode", "buy_black_market_item", MakeRPCCallback("buy_black_market_item"))
+AddModRPCHandler("rogue_mode", "recycle_item", MakeRPCCallback("recycle_item"))
+AddModRPCHandler("rogue_mode", "open_recycle_bin", MakeRPCCallback("open_recycle_bin"))
+AddModRPCHandler("rogue_mode", "close_recycle_bin", MakeRPCCallback("close_recycle_bin"))
+AddModRPCHandler("rogue_mode", "recycle_all_items", MakeRPCCallback("recycle_all_items"))
+AddModRPCHandler("rogue_mode", "reload_config", MakeRPCCallback("reload_config"))
 
 if RemapSoundEvent then
     RemapSoundEvent("rifts4/rabbit_king/aggressive/spawn_pst", "dontstarve/common/dropGeneric")
@@ -143,9 +228,8 @@ local function IsRogueAffixCandidatePrefab(prefab)
     return prefab ~= nil and ROGUE_AFFIX_PREFAB_WHITELIST[prefab] == true
 end
 
-AddPrefabPostInitAny(function(inst)
-    -- 为带有词缀的装备添加网络同步和悬浮提示
-    if IsRogueAffixCandidatePrefab(inst.prefab) then
+for prefab_name, _ in pairs(ROGUE_AFFIX_PREFAB_WHITELIST) do
+    AddPrefabPostInit(prefab_name, function(inst)
         if not inst._rogue_affix_nettext then
             inst._rogue_affix_nettext = GLOBAL.net_string(inst.GUID, "rogue_affix_nettext", "roguedirty")
             
@@ -173,16 +257,16 @@ AddPrefabPostInitAny(function(inst)
                         elseif i.components and i.components.named then
                             base_name = i.components.named:GetName()
                         else
-                            base_name = i.name or (GLOBAL.STRINGS.NAMES[string.upper(i.prefab)] or "")
+                            base_name = STRINGS.NAMES[string.upper(i.prefab)] or i.prefab
                         end
                     end
                     
-                    return (base_name or "") .. affix_text
+                    return string.format("[%s] %s", affix_text, base_name)
                 end
             end
         end
-    end
-end)
+    end)
+end
 
 if not IsServer then return end
 
@@ -197,7 +281,6 @@ local DAILY_KIND_NAMES = RogueConfig.DAILY_KIND_NAMES
 local WAVE_RULE_DEFS = RogueConfig.WAVE_RULE_DEFS
 local REGION_ROUTE_DEFS = RogueConfig.REGION_ROUTE_DEFS
 local SUPPLY_DEFS = RogueConfig.SUPPLY_DEFS
-local CATASTROPHE_DEFS = RogueConfig.CATASTROPHE_DEFS
 local CHALLENGE_KIND_NAMES = RogueConfig.CHALLENGE_KIND_NAMES
 local DAILY_TASK_KIND_WEIGHTS = RogueConfig.DAILY_TASK_KIND_WEIGHTS
 local DAILY_TASK_ROTATION_MODS = RogueConfig.DAILY_TASK_ROTATION_MODS
@@ -215,6 +298,11 @@ local SEASON_OBJECTIVE_BALANCE = RogueConfig.SEASON_OBJECTIVE_BALANCE
 local SEASON_STYLE_NAMES = RogueConfig.SEASON_STYLE_NAMES
 local DROP_PITY_RULES = RogueConfig.DROP_PITY_RULES
 local VNEXT_DROP_BALANCE = RogueConfig.VNEXT_DROP_BALANCE
+local COOP_BUFF_DEFS = RogueConfig.COOP_BUFF_DEFS
+local COOP_REVIVE_COST = RogueConfig.COOP_REVIVE_COST
+local COOP_EVENT_DEFS = RogueConfig.COOP_EVENT_DEFS
+local SEASON_MILESTONE_DEFS = RogueConfig.SEASON_MILESTONE_DEFS
+local SEASON_MILESTONE_UNLOCK_METRICS = RogueConfig.SEASON_MILESTONE_UNLOCK_METRICS
 
 -- [工具函数] --------------------------------------------------------------------
 
@@ -288,6 +376,8 @@ AddPrefabPostInit("world", function(inst)
         return
     end
 
+    inst:AddComponent("rogue_ai_npc_manager")
+
     if inst.components.wagpunk_arena_manager then
         inst.components.wagpunk_arena_manager.OnInit = function() end
         inst:RemoveComponent("wagpunk_arena_manager")
@@ -302,6 +392,7 @@ AddPrefabPostInit("world", function(inst)
             local old_FadeOutFinished = player.components.roccontroller.FadeOutFinished
             if type(old_FadeOutFinished) == "function" then
                 player.components.roccontroller.FadeOutFinished = function(self)
+                    old_FadeOutFinished(self) -- call the original function
                     self.inst:DoTaskInTime(2, function()
                         local pt
                         if self.inst.roc_nest and self.inst.roc_nest:IsValid() then
@@ -356,19 +447,8 @@ AddComponentPostInit("batted", function(self)
     local raw_on_update = self.OnUpdate
     if type(raw_on_update) == "function" then
         self.OnUpdate = function(component, dt)
-            local ok = pcall(raw_on_update, component, dt)
-            if not ok then
-                if component then
-                    component.OnUpdate = function() end
-                    if type(component.LongUpdate) == "function" then
-                        component.LongUpdate = function() end
-                    end
-                    local inst = component.inst
-                    if inst and type(inst.StopUpdatingComponent) == "function" then
-                        inst:StopUpdatingComponent(component)
-                    end
-                end
-            end
+            if not component or not component.inst or not component.inst:IsValid() then return end
+            raw_on_update(component, dt)
         end
     end
 end)
@@ -429,6 +509,18 @@ local function GetEntityName(ent)
     return RogueHelpers.GetEntityName(ent)
 end
 
+local function SafeSpawnPrefab(prefab)
+    return RogueHelpers.SafeSpawnPrefab(prefab)
+end
+
+local function SafeCall(fn, ...)
+    return RogueHelpers.SafeCall(fn, ...)
+end
+
+local function SafeFindEntities(x, y, z, radius, tags, excludetags)
+    return RogueHelpers.SafeFindEntities(x, y, z, radius, tags, excludetags)
+end
+
 local AffixSystem = RogueAffixSystem.Create({
     Config = Config,
     CONST = CONST,
@@ -448,8 +540,12 @@ local AffixSystem = RogueAffixSystem.Create({
         GetWorld = function() return GLOBAL.TheWorld end,
         Announce = Announce,
         GetEntityName = GetEntityName,
+        RogueBossMechanicsV2 = RogueBossMechanicsV2, -- 注入 V2 核心
     }),
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     CollectAlivePlayers = CollectAlivePlayers,
     PickRandom = PickRandom,
     FindWalkableOffset = FindWalkableOffset,
@@ -475,6 +571,9 @@ local DropSystem = RogueDropSystem.Create({
     ResolveRuntimePrefab = ResolveRuntimePrefab,
     IsPrefabRegistered = IsPrefabRegistered,
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     FindWalkableOffset = FindWalkableOffset,
     PI = PI,
     Config = Config,
@@ -499,6 +598,8 @@ local DropSystem = RogueDropSystem.Create({
     BossLoot = RogueBossLoot,
     GLOBAL = GLOBAL,
     TheSim = GLOBAL.TheSim,
+    ROGUE_AFFIX_PREFAB_WHITELIST = ROGUE_AFFIX_PREFAB_WHITELIST,
+    AddPrefabPostInit = AddPrefabPostInit,
 })
 DropSystem.RegisterItemPersistenceHook()
 
@@ -511,7 +612,11 @@ local function DropLoot(victim, is_boss, day, killer)
 end
 
 local function ApplyBuff(player, is_boss)
-    return DropSystem.ApplyBuff(player, is_boss)
+    local result = DropSystem.ApplyBuff(player, is_boss)
+    if player and player.rogue_data then
+        PlayerState.SyncGrowthNetvars(player, player.rogue_data)
+    end
+    return result
 end
 
 local TalentSupply = RogueTalentSupply.Create({
@@ -528,6 +633,7 @@ local TalentSupply = RogueTalentSupply.Create({
     SpawnDrop = SpawnDrop,
     Announce = Announce,
     GetCurrentDay = function() return GLOBAL.TheWorld.state.cycles + 1 end,
+    SetRPCHandler = SetRPCHandler,
 })
 TalentSupply.RegisterRPCCallbacks()
 
@@ -584,6 +690,10 @@ local function CheckTalentTrigger(player)
     return TalentSupply.CheckTalentTrigger(player)
 end
 
+local function ReapplyTalentEffects(player)
+    return TalentSupply.ReapplyTalentEffects(player)
+end
+
 local RelicSystem = RogueRelicSystem.Create({
     GLOBAL = GLOBAL,
     SpawnPrefab = SpawnPrefab,
@@ -592,6 +702,7 @@ local RelicSystem = RogueRelicSystem.Create({
     SyncGrowthNetvars = SyncGrowthNetvars,
     IsValidPlayer = IsValidPlayer,
     Announce = Announce,
+    SetRPCHandler = SetRPCHandler,
 })
 RelicSystem.RegisterRPCCallbacks()
 
@@ -727,6 +838,9 @@ local EventSystem = RogueEventSystem.Create({
     PickWeightedCandidate = PickWeightedCandidate,
     ResolveRuntimePrefab = ResolveRuntimePrefab,
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     FindWalkableOffset = FindWalkableOffset,
     PI = PI,
     OfferRelicChoice = OfferRelicChoice,
@@ -748,7 +862,6 @@ local WaveSystem = RogueWaveSystem.Create({
     WAVE_RULE_DEFS = WAVE_RULE_DEFS,
     REGION_ROUTE_DEFS = REGION_ROUTE_DEFS,
     THREAT_ROTATION_MODS = THREAT_ROTATION_MODS,
-    CATASTROPHE_DEFS = CATASTROPHE_DEFS,
     CHALLENGE_KIND_NAMES = CHALLENGE_KIND_NAMES,
     EnsurePlayerData = EnsurePlayerData,
     SyncGrowthNetvars = SyncGrowthNetvars,
@@ -756,6 +869,9 @@ local WaveSystem = RogueWaveSystem.Create({
     ResolveRuntimePrefab = ResolveRuntimePrefab,
     IsPrefabRegistered = IsPrefabRegistered,
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     FindWalkableOffset = FindWalkableOffset,
     PI = PI,
     CollectAlivePlayers = CollectAlivePlayers,
@@ -777,6 +893,7 @@ local WaveSystem = RogueWaveSystem.Create({
     OnSeasonBountyReward = OnSeasonBountyReward,
     Announce = Announce,
     GLOBAL = GLOBAL,
+    SetRPCHandler = SetRPCHandler,
 })
 if WaveSystem.RegisterRPCCallbacks then
     WaveSystem.RegisterRPCCallbacks()
@@ -840,10 +957,59 @@ end
 local ShopSystem = RogueShopSystem.Create({
     EnsurePlayerData = EnsurePlayerData,
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     Announce = Announce,
+    DropSystem = DropSystem,
+    IsMasterSim = function() return GLOBAL.TheWorld and GLOBAL.TheWorld.ismastersim end,
+    AddComponentPostInit = AddComponentPostInit,
 })
-GLOBAL._rogue_mode_buy_shop_item_rpc = ShopSystem.BuyItem
-GLOBAL._rogue_mode_recycle_item_rpc = ShopSystem.RecycleItem
+-- 注册升级属性持久化钩子：确保武器/护甲/装备的强化数据在存档加载时自动恢复
+ShopSystem.InitPersistence()
+SetRPCHandler("buy_shop_item", ShopSystem.BuyItem)
+SetRPCHandler("buy_black_market_item", ShopSystem.BuyBlackMarketItem)
+SetRPCHandler("recycle_item", ShopSystem.RecycleItem)
+SetRPCHandler("open_recycle_bin", ShopSystem.OpenRecycleBin)
+SetRPCHandler("close_recycle_bin", ShopSystem.CloseRecycleBin)
+SetRPCHandler("recycle_all_items", ShopSystem.RecycleAllItems)
+
+-- 函数说明：创建套装效果系统实例。
+local SetBonusSystem = RogueSetBonus.Create({
+    SET_BONUS_DEFS = RogueConfig.SET_BONUS_DEFS,
+    EnsurePlayerData = EnsurePlayerData,
+    Announce = Announce,
+    DAMAGE_MODIFIER_KEY = CONST.DAMAGE_MODIFIER_KEY,
+})
+
+-- 函数说明：创建连锁事件系统实例。
+local ChainEventSystem = RogueChainEvent.Create({
+    EnsurePlayerData = EnsurePlayerData,
+    Announce = Announce,
+    SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
+    CollectAlivePlayers = CollectAlivePlayers,
+    PickRandom = PickRandom,
+    GetWorld = GetWorld,
+    IsValidPlayer = IsValidPlayer,
+    FindWalkableOffset = FindWalkableOffset,
+    PI = PI,
+    GLOBAL = GLOBAL,
+})
+
+-- 函数说明：创建成就/里程碑系统实例。
+local AchievementSystem = RogueAchievement.Create({
+    EnsurePlayerData = EnsurePlayerData,
+    Announce = Announce,
+    SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
+    IsValidPlayer = IsValidPlayer,
+    SyncGrowthNetvars = SyncGrowthNetvars,
+})
 
 local RuntimeSystem = RogueRuntimeSystem.Create({
     GLOBAL = GLOBAL,
@@ -851,6 +1017,9 @@ local RuntimeSystem = RogueRuntimeSystem.Create({
     CONST = CONST,
     AllPlayers = AllPlayers,
     SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
     AddPlayerPostInit = AddPlayerPostInit,
     AddPrefabPostInit = AddPrefabPostInit,
     IsMasterSim = function() return GLOBAL.TheWorld and GLOBAL.TheWorld.ismastersim end,
@@ -876,6 +1045,16 @@ local RuntimeSystem = RogueRuntimeSystem.Create({
     SyncWaveStateToAllPlayers = SyncWaveStateToAllPlayers,
     ApplyBuff = ApplyBuff,
     CheckTalentTrigger = CheckTalentTrigger,
+    ReapplyTalentEffects = ReapplyTalentEffects,
+    RegisterSetBonusWatcher = function(player) SetBonusSystem.RegisterEquipmentWatcher(player) end,
+    RefreshSetBonuses = function(player)
+        SetBonusSystem.RefreshSetBonuses(player)
+        if player and player.rogue_data then
+            PlayerState.SyncGrowthNetvars(player, player.rogue_data)
+        end
+    end,
+    CheckAchievement = function(player, kind, amount) AchievementSystem.CheckProgress(player, kind, amount) end,
+    TriggerChainEvent = function(player, trigger_type) ChainEventSystem.TryTrigger(player, trigger_type) end,
     OfferInitialRelicChoice = OfferInitialRelicChoice,
     CheckRelicTrigger = CheckRelicTrigger,
     GetWaveState = function() return wave_state end,
@@ -892,3 +1071,70 @@ local RuntimeSystem = RogueRuntimeSystem.Create({
 })
 RuntimeSystem.RegisterPlayerLifecycle()
 RuntimeSystem.RegisterWorldLifecycle()
+
+-- [多人协作系统] --------------------------------------------------------------------
+
+local CoopSystem = RogueCoopSystem.Create({
+    COOP_BUFF_DEFS = COOP_BUFF_DEFS,
+    COOP_REVIVE_COST = COOP_REVIVE_COST,
+    COOP_EVENT_DEFS = COOP_EVENT_DEFS,
+    IsValidPlayer = IsValidPlayer,
+    EnsurePlayerData = EnsurePlayerData,
+    SyncGrowthNetvars = SyncGrowthNetvars,
+    SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
+    Announce = Announce,
+    CollectAlivePlayers = CollectAlivePlayers,
+    GLOBAL = GLOBAL,
+    PoolCatalog = PoolCatalog,
+    PickWeightedCandidate = PickWeightedCandidate,
+    FindWalkableOffset = FindWalkableOffset,
+    PI = PI,
+    GetWaveState = function() return wave_state end,
+    DropLoot = DropLoot,
+})
+
+-- [赛季里程碑系统] --------------------------------------------------------------------
+
+local MilestoneSystem = RogueMilestoneSystem.Create({
+    SEASON_MILESTONE_DEFS = SEASON_MILESTONE_DEFS,
+    SEASON_MILESTONE_UNLOCK_METRICS = SEASON_MILESTONE_UNLOCK_METRICS,
+    EnsurePlayerData = EnsurePlayerData,
+    SyncGrowthNetvars = SyncGrowthNetvars,
+    IsValidPlayer = IsValidPlayer,
+    SpawnDrop = SpawnDrop,
+    Announce = Announce,
+    PoolCatalog = PoolCatalog,
+    PickWeightedCandidate = PickWeightedCandidate,
+    SpawnPrefab = SpawnPrefab,
+    SafeSpawnPrefab = SafeSpawnPrefab,
+    SafeCall = SafeCall,
+    SafeFindEntities = SafeFindEntities,
+    CollectAlivePlayers = CollectAlivePlayers,
+    GrantRelicChoice = OfferRelicChoice,
+})
+
+-- [配置热更新系统] --------------------------------------------------------------------
+
+local ConfigHotreload = RogueConfigHotreload.Create({
+    RogueConfig = RogueConfig,
+    GetModConfigData = function(key) return GetModConfigData(key) end,
+    Config = Config,
+    GetTime = GetTime,
+    Announce = Announce,
+    WaveSystem = WaveSystem,
+    RuntimeSystem = RuntimeSystem,
+})
+ConfigHotreload.InitSnapshot(Config)
+
+SetRPCHandler("reload_config", function(player)
+    if not IsValidPlayer(player) then return end
+    local ok, count = ConfigHotreload.ReloadConfig()
+    if ok then
+        if player.components.talker then
+            player.components.talker:Say("配置已热更新！变更 " .. tostring(count or 0) .. " 项")
+        end
+    end
+end)

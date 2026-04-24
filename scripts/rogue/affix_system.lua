@@ -258,6 +258,119 @@ function M.Create(deps)
                     end
                 end)
             end
+        elseif affix_id == "phantom" then
+            if not ent.rogue_phantom_hooked then
+                ent.rogue_phantom_hooked = true
+                ent.rogue_phantom_dodge_cd = false
+                ent:ListenForEvent("attacked", function(inst, data)
+                    if inst.rogue_phantom_dodge_cd then return end
+                    if math.random() < 0.25 then
+                        inst.rogue_phantom_dodge_cd = true
+                        inst:DoTaskInTime(3, function() inst.rogue_phantom_dodge_cd = false end)
+                        if inst.components.health then
+                            inst.components.health:DoDelta(0, nil, "phantom_dodge")
+                        end
+                        if inst.components.locomotor then
+                            local orig_speed = inst.components.locomotor:GetSpeedMultiplier()
+                            inst.components.locomotor:SetExternalSpeedMultiplier(inst, "rogue_phantom_dodge", 2.0)
+                            inst:DoTaskInTime(1.5, function()
+                                if inst and inst:IsValid() and inst.components.locomotor then
+                                    inst.components.locomotor:RemoveExternalSpeedMultiplier(inst, "rogue_phantom_dodge")
+                                end
+                            end)
+                        end
+                    end
+                end)
+            end
+        elseif affix_id == "enrage" then
+            if not ent.rogue_enrage_hooked then
+                ent.rogue_enrage_hooked = true
+                ent:ListenForEvent("attacked", function(inst, data)
+                    if not inst.components.combat or not inst.components.health then return end
+                    local hp_pct = inst.components.health:GetPercent()
+                    if hp_pct < 0.5 and not inst.rogue_enraged then
+                        inst.rogue_enraged = true
+                        if inst.components.combat.externaldamagemultipliers then
+                            inst.components.combat.externaldamagemultipliers:SetModifier(inst, 1.6, "rogue_enrage")
+                        end
+                        if inst.components.locomotor then
+                            inst.components.locomotor:SetExternalSpeedMultiplier(inst, "rogue_enrage", 1.3)
+                        end
+                        inst:DoTaskInTime(8, function()
+                            if inst and inst:IsValid() then
+                                inst.rogue_enraged = false
+                                if inst.components.combat and inst.components.combat.externaldamagemultipliers then
+                                    inst.components.combat.externaldamagemultipliers:RemoveModifier(inst, "rogue_enrage")
+                                end
+                                if inst.components.locomotor then
+                                    inst.components.locomotor:RemoveExternalSpeedMultiplier(inst, "rogue_enrage")
+                                end
+                            end
+                        end)
+                    end
+                end)
+            end
+        elseif affix_id == "toxic" then
+            if not ent.rogue_toxic_hooked then
+                ent.rogue_toxic_hooked = true
+                ent:ListenForEvent("onhitother", function(inst, data)
+                    local target = data and data.target
+                    if not target or not target:IsValid() then return end
+                    if target.rogue_toxic_cd then return end
+                    target.rogue_toxic_cd = true
+                    target:DoTaskInTime(2, function(t)
+                        if t and t:IsValid() then t.rogue_toxic_cd = nil end
+                    end)
+                    local tick_count = 0
+                    target:DoPeriodicTask(1, function(t)
+                        tick_count = tick_count + 1
+                        if t and t:IsValid() and t.components.health and not t.components.health:IsDead() and tick_count <= 4 then
+                            t.components.health:DoDelta(-8, nil, "rogue_toxic")
+                        else
+                            if t and t:IsValid() then t.rogue_toxic_cd = nil end
+                        end
+                    end)
+                end)
+            end
+        elseif affix_id == "mirror" then
+            if not ent.rogue_mirror_hooked then
+                ent.rogue_mirror_hooked = true
+                ent:ListenForEvent("attacked", function(inst, data)
+                    if not data or not data.attacker then return end
+                    if math.random() < 0.2 then
+                        local attacker = data.attacker
+                        if attacker and attacker:IsValid() and attacker.components.combat and attacker.components.health and not attacker.components.health:IsDead() then
+                            local reflect_dmg = (data.damage or 20) * 0.5
+                            attacker.components.health:DoDelta(-reflect_dmg, nil, "rogue_mirror", nil, inst, true)
+                        end
+                    end
+                end)
+            end
+        elseif affix_id == "soul_link" then
+            if not ent.rogue_soul_link_hooked then
+                ent.rogue_soul_link_hooked = true
+                ent:ListenForEvent("onhitother", function(inst, data)
+                    local target = data and data.target
+                    if not target or not target:IsValid() then return end
+                    if not target.components.combat or not target.components.health then return end
+                    local x, y, z = inst.Transform:GetWorldPosition()
+                    local ents = TheSim:FindEntities(x, y, z, 12, {"_combat"}, {"player", "companion", "INLIMBO", "NOCLICK", "FX"})
+                    local allies = {}
+                    for _, e in ipairs(ents) do
+                        if e ~= inst and e:IsValid() and e.components.health and not e.components.health:IsDead() and e:HasTag("rogue_affix") then
+                            table.insert(allies, e)
+                        end
+                    end
+                    if #allies > 0 then
+                        local heal = (data.damage or 10) * 0.15
+                        for _, ally in ipairs(allies) do
+                            if ally.components.health then
+                                ally.components.health:DoDelta(heal, nil, "rogue_soul_link")
+                            end
+                        end
+                    end
+                end)
+            end
         end
     end
 

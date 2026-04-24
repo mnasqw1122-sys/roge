@@ -108,7 +108,6 @@ function M.Create(deps)
         data.season_hist1_deaths = e1.deaths or 0
         data.season_hist1_build = e1.build_score or 0
         data.season_hist1_route = e1.route_id or 0
-        data.season_hist1_catastrophe_days = e1.catastrophe_days or 0
         data.season_hist1_challenge_done = e1.challenge_done or 0
         data.season_hist1_challenge_total = e1.challenge_total or 0
         data.season_hist1_bounty_done = e1.bounty_done or 0
@@ -123,7 +122,6 @@ function M.Create(deps)
         data.season_hist2_deaths = e2.deaths or 0
         data.season_hist2_build = e2.build_score or 0
         data.season_hist2_route = e2.route_id or 0
-        data.season_hist2_catastrophe_days = e2.catastrophe_days or 0
         data.season_hist2_challenge_done = e2.challenge_done or 0
         data.season_hist2_challenge_total = e2.challenge_total or 0
         data.season_hist2_bounty_done = e2.bounty_done or 0
@@ -138,7 +136,6 @@ function M.Create(deps)
         data.season_hist3_deaths = e3.deaths or 0
         data.season_hist3_build = e3.build_score or 0
         data.season_hist3_route = e3.route_id or 0
-        data.season_hist3_catastrophe_days = e3.catastrophe_days or 0
         data.season_hist3_challenge_done = e3.challenge_done or 0
         data.season_hist3_challenge_total = e3.challenge_total or 0
         data.season_hist3_bounty_done = e3.bounty_done or 0
@@ -173,7 +170,6 @@ function M.Create(deps)
             data.build_rarity_counts = { common = 0, rare = 0, epic = 0, legendary = 0 }
             data.build_score = 0
             data.season_route_pick_counts = {}
-            data.season_catastrophe_days = 0
             data.season_last_style_id = 0
             
             RefreshSeasonHistorySnapshot(data)
@@ -346,7 +342,7 @@ function M.Create(deps)
         return best_id, "未知"
     end
 
-    local function EvaluateSeasonStyleByMetrics(ch_done, ch_total, bo_done, bo_total, cata_days, deaths)
+    local function EvaluateSeasonStyleByMetrics(ch_done, ch_total, bo_done, bo_total, deaths)
         local ch_rate = ch_total > 0 and (ch_done / ch_total) or 0
         local bo_rate = bo_total > 0 and (bo_done / bo_total) or 0
         local style_id = 6
@@ -356,7 +352,7 @@ function M.Create(deps)
             style_id = 2
         elseif bo_rate >= 0.8 and ch_rate <= 0.45 then
             style_id = 3
-        elseif cata_days >= 6 and deaths <= 2 then
+        elseif deaths <= 2 and (ch_rate >= 0.6 or bo_rate >= 0.6) then
             style_id = 4
         elseif deaths == 0 and (ch_rate >= 0.5 or bo_rate >= 0.5) then
             style_id = 5
@@ -371,7 +367,6 @@ function M.Create(deps)
             data.season_challenge_total or 0,
             data.season_bounty_done or 0,
             data.season_bounty_total or 0,
-            data.season_catastrophe_days or 0,
             data.season_deaths or 0
         )
     end
@@ -390,7 +385,6 @@ function M.Create(deps)
         data.season_hist1_deaths = e1.deaths or 0
         data.season_hist1_build = e1.build_score or 0
         data.season_hist1_route = e1.route_id or 0
-        data.season_hist1_catastrophe_days = e1.catastrophe_days or 0
         data.season_hist1_challenge_done = e1.challenge_done or 0
         data.season_hist1_challenge_total = e1.challenge_total or 0
         data.season_hist1_bounty_done = e1.bounty_done or 0
@@ -405,7 +399,6 @@ function M.Create(deps)
         data.season_hist2_deaths = e2.deaths or 0
         data.season_hist2_build = e2.build_score or 0
         data.season_hist2_route = e2.route_id or 0
-        data.season_hist2_catastrophe_days = e2.catastrophe_days or 0
         data.season_hist2_challenge_done = e2.challenge_done or 0
         data.season_hist2_challenge_total = e2.challenge_total or 0
         data.season_hist2_bounty_done = e2.bounty_done or 0
@@ -420,7 +413,6 @@ function M.Create(deps)
         data.season_hist3_deaths = e3.deaths or 0
         data.season_hist3_build = e3.build_score or 0
         data.season_hist3_route = e3.route_id or 0
-        data.season_hist3_catastrophe_days = e3.catastrophe_days or 0
         data.season_hist3_challenge_done = e3.challenge_done or 0
         data.season_hist3_challenge_total = e3.challenge_total or 0
         data.season_hist3_bounty_done = e3.bounty_done or 0
@@ -441,7 +433,6 @@ function M.Create(deps)
         local style_id, style_tag = EvaluateSeasonStyle(data)
         data.season_last_style_id = style_id
         local route_id, route_name = GetPreferredRoute(data)
-        local catastrophe_days = data.season_catastrophe_days or 0
         data.season_history = data.season_history or {}
         table.insert(data.season_history, 1, {
             day = day,
@@ -457,7 +448,6 @@ function M.Create(deps)
             team_badges = team_badges or {},
             route_id = route_id,
             route_name = route_name,
-            catastrophe_days = catastrophe_days,
             challenge_done = data.season_challenge_done or 0,
             challenge_total = data.season_challenge_total or 0,
             bounty_done = data.season_bounty_done or 0,
@@ -570,7 +560,6 @@ function M.Create(deps)
         local total_challenge_total = 0
         local total_bounty_done = 0
         local total_bounty_total = 0
-        local total_cata_days = 0
         local total_medals = 0
         local total_build = 0
         local _, player_badges_map = BuildPlayerHighlights(rows)
@@ -588,7 +577,6 @@ function M.Create(deps)
             total_challenge_total = total_challenge_total + (row.data.season_challenge_total or 0)
             total_bounty_done = total_bounty_done + (row.data.season_bounty_done or 0)
             total_bounty_total = total_bounty_total + (row.data.season_bounty_total or 0)
-            total_cata_days = total_cata_days + (row.data.season_catastrophe_days or 0)
             total_build = total_build + (row.data.build_score or 0)
         end
         local team_highlights, team_badges = BuildTeamHighlights(total_kills, total_boss, total_challenge, total_deaths, total_build, #rows)
@@ -607,8 +595,7 @@ function M.Create(deps)
                 end
             end
         end
-        local avg_cata_days = (#rows > 0) and math.floor(total_cata_days / #rows + 0.5) or 0
-        local team_style_id, team_style = EvaluateSeasonStyleByMetrics(total_challenge, total_challenge_total, total_bounty_done, total_bounty_total, avg_cata_days, total_deaths)
+        local team_style_id, team_style = EvaluateSeasonStyleByMetrics(total_challenge, total_challenge_total, total_bounty_done, total_bounty_total, total_deaths)
         local lines = {
             "赛季结算：第" .. tostring(day) .. "天结束，参与人数 " .. tostring(#rows) .. "。本季风格：" .. tostring(team_style) .. "(#" .. tostring(team_style_id) .. ")",
             "团队统计：总分" .. tostring(total_score) .. " 击杀" .. tostring(total_kills) .. " Boss" .. tostring(total_boss) .. " 精英" .. tostring(total_elite),

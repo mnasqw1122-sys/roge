@@ -6,6 +6,10 @@
 ]]
 local Widget = require "widgets/widget"
 local Text = require "widgets/text"
+local Image = require "widgets/image"
+local ImageButton = require "widgets/imagebutton"
+local NineSlice = require "widgets/nineslice"
+local ScrollableList = require "widgets/scrollablelist"
 local RogueConfig = require("rogue/config")
 local StateSchema = require("rogue/state_schema")
 local RogueShopPanel = require("widgets/rogue_shop_panel")
@@ -19,23 +23,10 @@ local SEASON_ROTATION_NAMES = RogueConfig.SEASON_ROTATION_NAMES
 local SEASON_OBJECTIVE_NAMES = RogueConfig.SEASON_OBJECTIVE_NAMES
 local WAVE_RULE_NAMES = RogueConfig.WAVE_RULE_NAMES
 local THREAT_TIER_NAMES = RogueConfig.THREAT_TIER_NAMES
-local CATASTROPHE_NAMES = RogueConfig.CATASTROPHE_NAMES
 local REGION_ROUTE_NAMES = RogueConfig.REGION_ROUTE_NAMES
 local PLAYER_BADGE_NAMES = RogueConfig.PLAYER_BADGE_NAMES
 local TEAM_BADGE_NAMES = RogueConfig.TEAM_BADGE_NAMES
 local SEASON_STYLE_NAMES = RogueConfig.SEASON_STYLE_NAMES
-
-local CATASTROPHE_TIER_NAMES = {
-    [1] = "初阶",
-    [2] = "中阶",
-    [3] = "末阶",
-}
-
-local CATASTROPHE_EFFECT_TEXTS = {
-    [1] = "降雨增湿+腐蚀，敌人附带潮湿压制",
-    [2] = "暗影扰动+理智压制，敌人追猎更频繁",
-    [3] = "红月落雷+场地压迫，敌人周期冲刺爆发",
-}
 
 local MAX_VISIBLE_LINES = 20
 local INFO_PAGE_SECONDS = 4
@@ -156,43 +147,113 @@ local function ShowLocalHint(msg)
 end
 
 local RogueStatusDisplay = Class(Widget, function(self, owner)
-    -- 函数说明：初始化右上角状态面板，避免遮挡左侧制作栏交互
     Widget._ctor(self, "RogueStatusDisplay")
     self.owner = owner
     
-    self:SetPosition(0, 0, 0)
+    -- 面板配置参数
+    self.panel_width = 256
+    self.panel_height = 384
+
+    -- 缓存上一次快照，用于去重刷新
+    self._cached_snapshot = nil
+    -- dirty事件监听器函数引用
+    self._netvar_listener = nil
+    -- dirty事件节流计时器（避免同一帧多次触发）
+    self._dirty_pending = false
+    -- 当前标签页: "status" 或 "bonus"
+    self.current_tab = "status"
+    -- 加成标签页缓存的快照（独立于状态标签页）
+    self._cached_bonus_text = nil
+    -- 标签页切换待刷新标志
+    self._tab_switch_pending = false
+
+    -- topright_root 外层已有 ANCHOR_RIGHT + ANCHOR_TOP
+    -- 子节点原点在屏幕右上角，需要向左偏移面板宽度+边距
+    -- 额外偏移避开官方右上角UI（时钟、状态栏等）
+    self:SetPosition(-self.panel_width - 80, -self.panel_height / 2 - 60, 0)
     
-    -- 背景 (可选，简单点先只用文字)
-    -- self.bg = self:AddChild(Image("images/global.xml", "square.tex"))
+    -- 主显示面板
+    self.info_panel = self:AddChild(Widget("info_panel"))
+    self.info_panel:SetPosition(0, 0, 0)
+    self.info_panel:Hide()
     
-    -- 文字显示
-    self.text = self:AddChild(Text(BODYTEXTFONT, 30))
-    self.text:SetHAlign(ANCHOR_LEFT)
-    self.text:SetVAlign(ANCHOR_TOP)
-    self.text:SetPosition(0, 0, 0) -- 相对父节点 (0,0)，位置由父节点控制
-    self.text:SetColour(1, 1, 1, 1)
+    -- 九宫格背景面板（替代固定背景图）
+    -- 优先使用自定义九宫格纹理，失败时回退到官方 fepanels
+    local ns_ok, ns_result = pcall(function()
+        return self.info_panel:AddChild(NineSlice(
+            "images/rogue_panel.xml",
+            "topleft.tex", "top.tex", "topright.tex",
+            "left.tex", "center.tex", "right.tex",
+            "bottomleft.tex", "bottom.tex", "bottomright.tex"
+        ))
+    end)
+    if ns_ok and ns_result then
+        self.bg_frame = ns_result
+    else
+        self.bg_frame = self.info_panel:AddChild(NineSlice("images/fepanels.xml"))
+    end
+    self.bg_frame:SetSize(self.panel_width, self.panel_height)
+    self.bg_frame:SetPosition(0, 0, 0)
+
+    -- 顶部标题
+    self.header_text = self.info_panel:AddChild(Text(TITLEFONT, 30))
+    self.header_text:SetString("肉 鸽 信 息")
+    self.header_text:SetColour(0.9, 0.9, 0.9, 1)
+    self.header_text:SetPosition(0, self.panel_height / 2 - 45, 0)
+
+    -- 分割线 - 标题下方
+    self.divider = self.info_panel:AddChild(Image("images/global.xml", "square.tex"))
+    self.divider:SetSize(self.panel_width - 80, 2)
+    self.divider:SetTint(0.8, 0.8, 0.8, 0.5)
+    self.divider:SetPosition(0, self.panel_height / 2 - 65, 0)
+
+    -- 滚动列表容器
+    -- ScrollableList 内部布局：
+    --   滑动块初始 y = list_height/2 - 40
+    --   子项起始 y = list_height/2 - 20（比滑动块低20px）
+    -- 我们需要让滑动块和第一项文字都在分割线下方
+    local list_width = math.max(self.panel_width - 40, 40)
+    local list_height = math.max(self.panel_height - 130, 40)
+    -- 分割线 y = panel_height/2 - 65
+    -- 让滑动块在分割线下方30px处
+    local scrollbar_target_y = self.panel_height / 2 - 95
+    local list_offset_y = scrollbar_target_y - (list_height / 2 - 40)
+
+    self.list_root = self.info_panel:AddChild(Widget("list_root"))
+    self.list_root:SetPosition(0, list_offset_y, 0)
+
+    self.scroll_list = self.list_root:AddChild(ScrollableList({}, list_width, list_height, 40, 40))
+    self.scroll_list:SetPosition(0, 0, 0)
     
-    self.history_bg = self:AddChild(Image("images/global.xml", "square.tex"))
-    self.history_bg:SetSize(800, 400)
+    -- 历史战报背景（使用九宫格面板替代纯色方块）
+    local hist_ok, hist_result = pcall(function()
+        return self:AddChild(NineSlice(
+            "images/rogue_panel.xml",
+            "topleft.tex", "top.tex", "topright.tex",
+            "left.tex", "center.tex", "right.tex",
+            "bottomleft.tex", "bottom.tex", "bottomright.tex"
+        ))
+    end)
+    if hist_ok and hist_result then
+        self.history_bg = hist_result
+    else
+        self.history_bg = self:AddChild(NineSlice("images/fepanels.xml"))
+    end
+    self.history_bg:SetSize(600, 400)
     self.history_bg:SetTint(0, 0, 0, 0.85)
-    self.history_bg:SetPosition(-600, -350, 0)
+    self.history_bg:SetPosition(-300, -200, 0)
     self.history_bg:Hide()
 
-    self.history_title = self.history_bg:AddChild(Text(TITLEFONT, 45))
+    self.history_title = self.history_bg:AddChild(Text(TITLEFONT, 40))
     self.history_title:SetPosition(0, 160, 0)
     self.history_title:SetString("肉 鸽 历 史 战 报")
     self.history_title:SetColour(1, 0.8, 0.1, 1)
 
-    self.history_text = self.history_bg:AddChild(Text(BODYTEXTFONT, 25))
+    self.history_text = self.history_bg:AddChild(Text(UIFONT, 25))
     self.history_text:SetPosition(0, -30, 0)
     self.history_text:SetHAlign(ANCHOR_MIDDLE)
     self.history_text:SetVAlign(ANCHOR_MIDDLE)
     
-    -- 强制设置锚点，确保其相对于屏幕右上角
-    self:SetHAnchor(ANCHOR_RIGHT)
-    self:SetVAnchor(ANCHOR_TOP)
-    
-    self.text:SetClickable(false)
     self.history_bg:SetClickable(false)
 
     self.history_detail_index = 0
@@ -203,13 +264,11 @@ local RogueStatusDisplay = Class(Widget, function(self, owner)
         TheInput:AddKeyDownHandler(KEY_F4, function() self:CycleHistoryDetail() end),
     }
     
-    local ImageButton = require "widgets/imagebutton"
-
+    -- 商店按钮
     self.shop_btn = self:AddChild(ImageButton("images/ui.xml", "button_small.tex", "button_small_over.tex", "button_small_disabled.tex", "button_small_over.tex"))
-    self.shop_btn:SetPosition(-150, -450) -- 避开上方文字UI，避免重叠
+    self.shop_btn:SetPosition(-80, -self.panel_height / 2 - 30)
     self.shop_btn:SetText("商店")
     
-    -- 函数说明：动态获取并生成商店图标的悬浮提示信息（包含鼠标左右键图标与对应操作说明）
     self.shop_btn.GetTooltip = function(btn)
         if btn.focus then
             local rmb = TheInput:GetLocalizedControl(TheInput:GetControllerID(), CONTROL_SECONDARY)
@@ -229,7 +288,6 @@ local RogueStatusDisplay = Class(Widget, function(self, owner)
         end
     end)
     
-    -- 实现右键长按拖动功能
     local old_OnControl = self.shop_btn.OnControl
     self.shop_btn.OnControl = function(btn, control, down)
         if control == CONTROL_SECONDARY then
@@ -238,46 +296,77 @@ local RogueStatusDisplay = Class(Widget, function(self, owner)
                 btn.drag_start_pos = btn:GetPosition()
                 btn.drag_start_mouse = TheInput:GetScreenPosition()
                 return true
-            else
-                if btn.dragging then
-                    btn.dragging = false
-                    return true
-                end
             end
         end
         return old_OnControl(btn, control, down)
     end
+
+    -- 新的肉鸽信息显示开关按钮
+    self.info_btn = self:AddChild(ImageButton("images/rogue_icon.xml", "rogue_icon.tex"))
+    self.info_btn:SetPosition(20, -self.panel_height / 2 - 30)
+    self.info_btn:SetScale(0.12, 0.12, 1) -- 调整图标大小以符合游戏美观
     
-    -- 启动更新循环
+    self.info_btn.GetTooltip = function(btn)
+        if btn.focus then
+            local rmb = TheInput:GetLocalizedControl(TheInput:GetControllerID(), CONTROL_SECONDARY)
+            local lmb = TheInput:GetLocalizedControl(TheInput:GetControllerID(), CONTROL_PRIMARY)
+            return "肉鸽信息\n" .. lmb .. ": 打开/隐藏\n" .. rmb .. ": 右键拖动"
+        end
+    end
+    
+    self.info_btn:SetOnClick(function()
+        if self.info_panel:IsVisible() then
+            self.info_panel:Hide()
+        else
+            self.info_panel:Show()
+        end
+    end)
+    
+    local old_info_OnControl = self.info_btn.OnControl
+    self.info_btn.OnControl = function(btn, control, down)
+        if control == CONTROL_SECONDARY then
+            if down then
+                btn.dragging = true
+                btn.drag_start_pos = btn:GetPosition()
+                btn.drag_start_mouse = TheInput:GetScreenPosition()
+                return true
+            end
+        end
+        return old_info_OnControl(btn, control, down)
+    end
+
+    -- 标签按钮（状态/加成），放置在面板顶部
+    self.tab_status_btn = self.info_panel:AddChild(ImageButton("images/ui.xml", "button_small.tex", "button_small_over.tex", "button_small_disabled.tex", "button_small_over.tex"))
+    self.tab_status_btn:SetPosition(-40, self.panel_height / 2 - 15, 0)
+    self.tab_status_btn:SetText("状态")
+    self.tab_status_btn:SetScale(0.7, 0.7, 1)
+    self.tab_status_btn:SetTextColour(1, 0.8, 0.2, 1)
+    self.tab_status_btn:SetOnClick(function()
+        self:SwitchTab("status")
+    end)
+
+    self.tab_bonus_btn = self.info_panel:AddChild(ImageButton("images/ui.xml", "button_small.tex", "button_small_over.tex", "button_small_disabled.tex", "button_small_over.tex"))
+    self.tab_bonus_btn:SetPosition(40, self.panel_height / 2 - 15, 0)
+    self.tab_bonus_btn:SetText("加成")
+    self.tab_bonus_btn:SetScale(0.7, 0.7, 1)
+    self.tab_bonus_btn:SetTextColour(1, 1, 1, 1)
+    self.tab_bonus_btn:SetOnClick(function()
+        self:SwitchTab("bonus")
+    end)
+
     self:StartUpdating()
+
+    -- 注册dirty事件监听器，替代OnUpdate中的每帧轮询
+    -- 当服务端网络变量变更时，设置节流标志，在下一帧OnUpdate中批量刷新UI
+    if self.owner and self.owner.ListenForEvent then
+        self._netvar_listener = function()
+            self._dirty_pending = true
+        end
+        self.owner:ListenForEvent("rogue_dirty", self._netvar_listener)
+        -- 首次加载时立即触发一次刷新
+        self._dirty_pending = true
+    end
 end)
-
--- 尝试通过 RPC 向服务端发送选择天赋的请求
-function RogueStatusDisplay:TryPickTalent(slot)
-    if not self.owner or not self.owner:IsValid() then return false end
-    if not (self.owner.rogue_talent_pending and self.owner.rogue_talent_pending:value()) then return false end
-    if not (MOD_RPC and MOD_RPC["rogue_mode"] and MOD_RPC["rogue_mode"]["pick_talent"]) then return false end
-    SendModRPCToServer(MOD_RPC["rogue_mode"]["pick_talent"], slot)
-    return true
-end
-
--- 尝试通过 RPC 向服务端发送选择补给的请求
-function RogueStatusDisplay:TryPickSupply(slot)
-    if not self.owner or not self.owner:IsValid() then return false end
-    if not (self.owner.rogue_supply_pending and self.owner.rogue_supply_pending:value()) then return false end
-    if not (MOD_RPC and MOD_RPC["rogue_mode"] and MOD_RPC["rogue_mode"]["pick_supply"]) then return false end
-    SendModRPCToServer(MOD_RPC["rogue_mode"]["pick_supply"], slot)
-    return true
-end
-
--- 尝试通过 RPC 向服务端发送选择遗物的请求
-function RogueStatusDisplay:TryPickRelic(slot)
-    if not self.owner or not self.owner:IsValid() then return false end
-    if not (self.owner.rogue_relic_pending and self.owner.rogue_relic_pending:value()) then return false end
-    if not (MOD_RPC and MOD_RPC["rogue_mode"] and MOD_RPC["rogue_mode"]["pick_relic"]) then return false end
-    SendModRPCToServer(MOD_RPC["rogue_mode"]["pick_relic"], slot)
-    return true
-end
 
 function RogueStatusDisplay:TryPickRoute(slot)
     if not self.owner or not self.owner:IsValid() then return false end
@@ -288,15 +377,17 @@ function RogueStatusDisplay:TryPickRoute(slot)
     return true
 end
 
--- 根据优先级（遗物 > 天赋 > 补给）尝试执行操作
+-- 根据优先级（路线）尝试执行操作（遗物/天赋/补给已由弹窗面板处理）
 function RogueStatusDisplay:TryPickAction(slot)
-    if self:TryPickRoute(slot) then return end
-    if self:TryPickRelic(slot) then return end
-    if self:TryPickTalent(slot) then return end
-    self:TryPickSupply(slot)
+    self:TryPickRoute(slot)
 end
 
 function RogueStatusDisplay:OnRemoveFromEntity()
+    -- 移除dirty事件监听器
+    if self.owner and self._netvar_listener then
+        self.owner:RemoveEventCallback("rogue_dirty", self._netvar_listener)
+        self._netvar_listener = nil
+    end
     if self.key_handlers then
         for _, handler in ipairs(self.key_handlers) do
             if handler and handler.Remove then
@@ -304,6 +395,48 @@ function RogueStatusDisplay:OnRemoveFromEntity()
             end
         end
         self.key_handlers = nil
+    end
+end
+
+-- 函数说明：屏幕尺寸变化时重新调整面板布局
+-- topright_root 的 SCALEMODE_PROPORTIONAL 会自动处理缩放
+function RogueStatusDisplay:OnScreenSizeChanged()
+    self:SetPosition(-self.panel_width - 80, -self.panel_height / 2 - 60, 0)
+end
+
+-- 函数说明：切换到指定标签页，同时显示面板
+function RogueStatusDisplay:SwitchTab(tab)
+    if self.current_tab == tab then return end
+    self.current_tab = tab
+    self:UpdateTabButtons()
+    if self.header_text then
+        self.header_text:SetString(self.current_tab == "status" and "肉 鸽 信 息" or "肉 鸽 加 成")
+    end
+    if not self.info_panel:IsVisible() then
+        self.info_panel:Show()
+    end
+    self._cached_bonus_text = nil
+    self.last_bonus_hash = nil
+    self.last_content_hash = nil
+    self._tab_switch_pending = true
+    self._dirty_pending = true
+end
+
+-- 函数说明：更新标签按钮的视觉状态（高亮当前激活的标签）
+function RogueStatusDisplay:UpdateTabButtons()
+    if self.tab_status_btn then
+        if self.current_tab == "status" then
+            self.tab_status_btn:SetTextColour(1, 0.8, 0.2, 1)
+        else
+            self.tab_status_btn:SetTextColour(1, 1, 1, 1)
+        end
+    end
+    if self.tab_bonus_btn then
+        if self.current_tab == "bonus" then
+            self.tab_bonus_btn:SetTextColour(1, 0.8, 0.2, 1)
+        else
+            self.tab_bonus_btn:SetTextColour(1, 1, 1, 1)
+        end
     end
 end
 
@@ -323,21 +456,69 @@ function RogueStatusDisplay:CycleHistoryDetail()
 end
 
 function RogueStatusDisplay:OnUpdate(dt)
-    -- 处理按钮拖拽
-    if self.shop_btn and self.shop_btn.dragging then
-        local current_mouse = TheInput:GetScreenPosition()
-        local dx = current_mouse.x - self.shop_btn.drag_start_mouse.x
-        local dy = current_mouse.y - self.shop_btn.drag_start_mouse.y
-        local scale = TheFrontEnd and TheFrontEnd:GetHUDScale() or 1
-        self.shop_btn:SetPosition(self.shop_btn.drag_start_pos.x + dx / scale, self.shop_btn.drag_start_pos.y + dy / scale, 0)
+    -- 分辨率变化检测：当屏幕尺寸改变时重新调整面板位置
+    local screen_w, screen_h = TheSim:GetScreenSize()
+    if self._last_screen_w ~= screen_w or self._last_screen_h ~= screen_h then
+        self._last_screen_w = screen_w
+        self._last_screen_h = screen_h
+        self:OnScreenSizeChanged()
     end
 
-    -- 函数说明：按帧刷新文本，使用精简布局避免长文本超出屏幕
+    -- 处理按钮拖拽（每帧更新起始位置，确保按钮跟随鼠标；检测右键松开防止粘连）
+    if self.shop_btn and self.shop_btn.dragging then
+        if not TheInput:IsControlPressed(CONTROL_SECONDARY) then
+            self.shop_btn.dragging = false
+        else
+            local current_mouse = TheInput:GetScreenPosition()
+            local dx = current_mouse.x - self.shop_btn.drag_start_mouse.x
+            local dy = current_mouse.y - self.shop_btn.drag_start_mouse.y
+            local scale = TheFrontEnd and TheFrontEnd:GetHUDScale() or 1
+            self.shop_btn:SetPosition(self.shop_btn.drag_start_pos.x + dx / scale, self.shop_btn.drag_start_pos.y + dy / scale, 0)
+            self.shop_btn.drag_start_pos = self.shop_btn:GetPosition()
+            self.shop_btn.drag_start_mouse = current_mouse
+        end
+    end
+    
+    if self.info_btn and self.info_btn.dragging then
+        if not TheInput:IsControlPressed(CONTROL_SECONDARY) then
+            self.info_btn.dragging = false
+        else
+            local current_mouse = TheInput:GetScreenPosition()
+            local dx = current_mouse.x - self.info_btn.drag_start_mouse.x
+            local dy = current_mouse.y - self.info_btn.drag_start_mouse.y
+            local scale = TheFrontEnd and TheFrontEnd:GetHUDScale() or 1
+            self.info_btn:SetPosition(self.info_btn.drag_start_pos.x + dx / scale, self.info_btn.drag_start_pos.y + dy / scale, 0)
+            self.info_btn.drag_start_pos = self.info_btn:GetPosition()
+            self.info_btn.drag_start_mouse = current_mouse
+        end
+    end
+
+    -- 处理dirty事件节流：在OnUpdate中执行延迟的UI刷新
+    if self._dirty_pending then
+        self._dirty_pending = false
+        self:RefreshFromNetvars()
+    end
+end
+
+-- 函数说明：从网络变量刷新UI（由dirty事件或节流触发）
+-- 替代原OnUpdate中的每帧轮询，仅在数据变更时调用
+function RogueStatusDisplay:RefreshFromNetvars()
     if not self.owner or not self.owner:IsValid() then return end
     
-    -- 获取网络变量值
-    -- 注意：这些变量需要在 modmain.lua 中通过 net_ushortint 等定义
     local state = StateSchema.ReadFromNetvars(self.owner)
+    local snapshot_changed = StateSchema.SnapshotChanged(state, self._cached_snapshot)
+    local tab_switched = self._tab_switch_pending
+    self._tab_switch_pending = false
+
+    if not snapshot_changed and not tab_switched then
+        return
+    end
+    self._cached_snapshot = state
+
+    if self.current_tab == "bonus" then
+        self:RefreshBonusTab(state)
+        return
+    end
     local kills = state.rogue_kills or 0
     local points = state.rogue_points or 0
     local dmg_bonus = state.rogue_dmg_bonus or 0
@@ -372,9 +553,6 @@ function RogueStatusDisplay:OnUpdate(dt)
     local relic_c = state.rogue_relic_c or 0
     local relic_count = state.rogue_relic_count or 0
     local relic_synergy_count = state.rogue_relic_synergy_count or 0
-    local catastrophe_active = state.rogue_catastrophe_active == true
-    local catastrophe_id = state.rogue_catastrophe_id or 0
-    local catastrophe_tier = state.rogue_catastrophe_tier or 0
     local challenge_active = state.rogue_challenge_active == true
     local challenge_progress = state.rogue_challenge_progress or 0
     local challenge_target = state.rogue_challenge_target or 0
@@ -488,12 +666,6 @@ function RogueStatusDisplay:OnUpdate(dt)
         str = str .. string.format("\n通缉进度:%d/%d", bounty_progress, bounty_target)
     end
     str = str .. string.format("\n遗物数:%d  协同:%d", relic_count, relic_synergy_count)
-    if catastrophe_active then
-        local cname = CATASTROPHE_NAMES[catastrophe_id] or "未知"
-        local ctier = CATASTROPHE_TIER_NAMES[catastrophe_tier] or "未知"
-        local ceffect = CATASTROPHE_EFFECT_TEXTS[catastrophe_id] or "环境异常强化中"
-        str = str .. string.format("\n异变天灾:%s [%s]\n危险提示:%s", cname, ctier, ceffect)
-    end
     if challenge_active then
         str = str .. string.format("\n挑战房:%s %d/%d", CHALLENGE_KIND_NAMES[challenge_kind] or "未知", challenge_progress, challenge_target)
     end
@@ -563,7 +735,7 @@ function RogueStatusDisplay:OnUpdate(dt)
         self.history_text:SetString(hstr)
     end
 
-    str = str .. "\nF4打开/关闭历史战报"
+    str = str .. "\nF4历史"
     str = str .. string.format("\n赛季目标:%d/4", season_obj_done)
     local obj_page, page_rows = ObjectivePages(day, obj_a_cur, obj_a_tar, obj_b_cur, obj_b_tar, obj_c_cur, obj_c_tar, obj_d_cur, obj_d_tar)
     str = str .. string.format(" 页%d/2", obj_page)
@@ -571,76 +743,124 @@ function RogueStatusDisplay:OnUpdate(dt)
         str = str .. string.format("\n%s %d/%d", row.name or "目标", row.cur or 0, row.tar or 0)
     end
 
-    if talent_pending then
-        local adef = TALENT_LOOKUP[talent_a] or {}
-        local bdef = TALENT_LOOKUP[talent_b] or {}
-        local cdef = TALENT_LOOKUP[talent_c] or {}
-        local a = adef.name or "未知"
-        local b = bdef.name or "未知"
-        local c = cdef.name or "未知"
-        local ad = adef.desc or "无说明"
-        local bd = bdef.desc or "无说明"
-        local cd = cdef.desc or "无说明"
-        str = str .. string.format(
-            "\n天赋候选(F1/F2/F3):\n1.%s【%s】\n2.%s【%s】\n3.%s【%s】",
-            a, ad, b, bd, c, cd
-        )
-    end
-    if supply_pending then
-        local sadef = SUPPLY_LOOKUP[supply_a] or {}
-        local sbdef = SUPPLY_LOOKUP[supply_b] or {}
-        local scdef = SUPPLY_LOOKUP[supply_c] or {}
-        local sa = sadef.name or "未知"
-        local sb = sbdef.name or "未知"
-        local sc = scdef.name or "未知"
-        local sad = sadef.desc or "无说明"
-        local sbd = sbdef.desc or "无说明"
-        local scd = scdef.desc or "无说明"
-        str = str .. string.format(
-            "\n夜晚补给(F1/F2/F3):\n1.%s【%s】\n2.%s【%s】\n3.%s【%s】",
-            sa, sad, sb, sbd, sc, scd
-        )
-    end
-    if relic_pending then
-        local radef = RELIC_LOOKUP[relic_a] or {}
-        local rbdef = RELIC_LOOKUP[relic_b] or {}
-        local rcdef = RELIC_LOOKUP[relic_c] or {}
-        local ra = radef.name or "未知"
-        local rb = rbdef.name or "未知"
-        local rc = rcdef.name or "未知"
-        local rad = (radef.rarity_name or "普通") .. "·" .. (radef.desc or "无说明")
-        local rbd = (rbdef.rarity_name or "普通") .. "·" .. (rbdef.desc or "无说明")
-        local rcd = (rcdef.rarity_name or "普通") .. "·" .. (rcdef.desc or "无说明")
-        str = str .. string.format(
-            "\n遗物抉择(F1/F2/F3):\n1.%s【%s】\n2.%s【%s】\n3.%s【%s】",
-            ra, rad, rb, rbd, rc, rcd
-        )
-    end
-    
-    local display_str, display_lines = PaginateTextByLines(str, MAX_VISIBLE_LINES, INFO_PAGE_SECONDS)
-    self.text:SetString(display_str)
-    local y_offset = math.max(0, ((display_lines or 0) - 12) * 9)
-    self.text:SetPosition(0, -y_offset, 0)
 
-    local r, g, b, a = 1, 1, 1, 1
-    if season_phase >= 5 then
-        r, g, b = 0.82, 1, 0.86
-    elseif catastrophe_active then
-        if catastrophe_tier >= 3 then
-            local t = (GetTime and GetTime() or 0)
-            local pulse = 0.5 + 0.5 * math.sin(t * 7.5)
-            r = 1
-            g = 0.25 + 0.28 * pulse
-            b = 0.22 + 0.18 * pulse
-        elseif catastrophe_tier == 2 then
-            r, g, b = 1, 0.72, 0.32
-        else
-            r, g, b = 0.98, 0.9, 0.52
+    
+    
+    local new_content_hash = str
+    if self.last_content_hash ~= new_content_hash then
+        self.last_content_hash = new_content_hash
+        
+        local widgets = {}
+        local widget_index = 1
+        
+        for raw_line in (str .. "\n"):gmatch("(.-)\n") do
+            if raw_line and raw_line ~= "" then
+                -- 文字颜色
+                local r, g, b, a = 1, 1, 1, 1
+                if season_phase >= 5 then
+                    r, g, b = 0.82, 1, 0.86
+                elseif raw_line:find("遗物抉择") or raw_line:find("天赋候选") or raw_line:find("夜晚补给") then
+                    r, g, b = 0.85, 0.95, 1
+                end
+                
+                -- 函数说明：创建支持自动换行的文本组件
+                -- ScrollableList 会自动设置 Widget w 的位置：x = -list_width/2
+                -- Widget 原点在列表左边界，Text 应从原点向右渲染
+                local w = Widget("line_"..widget_index)
+
+                local text_width = math.max(self.panel_width - 60, 30)
+                local text_height = 40
+                local t = w:AddChild(Text(UIFONT, 22))
+                t:SetColour(r, g, b, a)
+                t:SetString(raw_line)
+                t:SetRegionSize(text_width, text_height)
+                t:EnableWordWrap(true)
+                t:SetHAlign(ANCHOR_LEFT)
+                t:SetVAlign(ANCHOR_TOP)
+                -- Text 盒子中心默认在 Widget 原点
+                -- 向右偏移 text_width/2 让左边界对齐 Widget 原点（列表左边界）
+                -- 向下偏移 text_height/2 让文字中心与滚动条滑动块对齐
+                -- ScrollableList 第一项 Widget 在 y=height/2-20，滑动块在 y=height/2-40
+                -- 两者差20px，所以文字需要从 Widget 原点向下偏移 text_height/2
+                t:SetPosition(text_width / 2, -text_height / 2)
+                
+                w.focus_forward = t
+                widgets[widget_index] = w
+                widget_index = widget_index + 1
+            end
         end
-    elseif relic_pending or talent_pending or supply_pending then
-        r, g, b = 0.85, 0.95, 1
+        
+        self.scroll_list:SetList(widgets)
     end
-    self.text:SetColour(r, g, b, a)
+
+end
+
+-- 函数说明：刷新加成标签页内容，从netvar读取服务端生成的加成摘要文本
+function RogueStatusDisplay:RefreshBonusTab(state)
+    if not state then return end
+
+    local bonus_text = state.rogue_bonus_text or ""
+    if bonus_text == self._cached_bonus_text then
+        return
+    end
+    self._cached_bonus_text = bonus_text
+
+    if bonus_text == "" then
+        bonus_text = "暂无加成"
+    end
+
+    local new_content_hash = bonus_text
+    if self.last_bonus_hash ~= new_content_hash then
+        self.last_bonus_hash = new_content_hash
+
+        local widgets = {}
+        local widget_index = 1
+
+        for raw_line in (bonus_text .. "\n"):gmatch("(.-)\n") do
+            if raw_line and raw_line ~= "" then
+                local r, g, b, a = 1, 1, 1, 1
+                if raw_line:find("═══攻击═══") then
+                    r, g, b = 1, 0.6, 0.4
+                elseif raw_line:find("═══防御═══") then
+                    r, g, b = 0.4, 0.7, 1
+                elseif raw_line:find("═══辅助═══") then
+                    r, g, b = 0.4, 1, 0.6
+                elseif raw_line:find("═══恢复═══") then
+                    r, g, b = 1, 1, 0.5
+                elseif raw_line:find("═══天赋═══") then
+                    r, g, b = 0.8, 0.5, 1
+                elseif raw_line:find("═══遗物═══") then
+                    r, g, b = 1, 0.85, 0.3
+                elseif raw_line:find("═══套装═══") then
+                    r, g, b = 0.3, 1, 0.8
+                elseif raw_line:find("═══构筑═══") then
+                    r, g, b = 1, 0.7, 0.9
+                elseif raw_line:find("协同:") then
+                    r, g, b = 0.5, 1, 1
+                elseif raw_line:find("构筑:") then
+                    r, g, b = 1, 0.9, 0.7
+                end
+
+                local w = Widget("bonus_line_"..widget_index)
+                local text_width = math.max(self.panel_width - 60, 30)
+                local text_height = 40
+                local t = w:AddChild(Text(UIFONT, 22))
+                t:SetColour(r, g, b, a)
+                t:SetString(raw_line)
+                t:SetRegionSize(text_width, text_height)
+                t:EnableWordWrap(true)
+                t:SetHAlign(ANCHOR_LEFT)
+                t:SetVAlign(ANCHOR_TOP)
+                t:SetPosition(text_width / 2, -text_height / 2)
+
+                w.focus_forward = t
+                widgets[widget_index] = w
+                widget_index = widget_index + 1
+            end
+        end
+
+        self.scroll_list:SetList(widgets)
+    end
 end
 
 return RogueStatusDisplay

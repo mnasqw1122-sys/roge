@@ -2,18 +2,16 @@
     文件说明：wave_system.lua
     功能：肉鸽模式的核心波次管理系统。
     负责控制每日波次的启动与结束，决定波次类型（普通/休息/Boss），生成各类敌人（普通、精英、Boss），
-    以及管理区域路线投票、异变天灾、悬赏和挑战房等波次专属事件。
+    以及管理区域路线投票、悬赏和挑战房等波次专属事件。
 ]]
 local M = {}
-local WaveCatastropheModule = require("rogue/wave_catastrophe")
 local WaveBossCompatModule = require("rogue/wave_boss_compat")
 
 function M.Create(deps)
     local S = {}
     local wave_active = false
     local wave_task = nil
-    local wave_state = { used_bosses = {}, current_rule = nil, bounty = nil, catastrophe = nil, catastrophe_runtime = nil, challenge = nil, catastrophe_task = nil, catastrophe_env_task = nil, route_active = nil, route_pending_day = nil, route_runtime = nil, route_drop_bonus = 0, route_votes = nil, route_vote_task = nil, threat_tier = 1, threat_reward_pct = 0, threat_runtime = nil, threat_drop_bonus = 0 }
-    local CatastropheController = WaveCatastropheModule.Create(deps)
+    local wave_state = { used_bosses = {}, current_rule = nil, bounty = nil, challenge = nil, route_active = nil, route_pending_day = nil, route_runtime = nil, route_drop_bonus = 0, route_votes = nil, route_vote_task = nil, threat_tier = 1, threat_reward_pct = 0, threat_runtime = nil, threat_drop_bonus = 0 }
     local BossCompatController = WaveBossCompatModule.Create(deps)
     
     -- 获取当前世界对象
@@ -53,7 +51,7 @@ function M.Create(deps)
         return nil
     end
 
-    -- 将波次状态（天灾、悬赏、挑战等）同步到玩家的网络变量
+    -- 将波次状态（悬赏、挑战等）同步到玩家的网络变量
     local function SyncWaveStateToPlayer(player)
         if not player or not player:IsValid() then return end
         local data = deps.EnsurePlayerData(player)
@@ -70,9 +68,6 @@ function M.Create(deps)
         data.bounty_active = wave_state.bounty and (wave_state.bounty.completed ~= true) or false
         data.bounty_progress = wave_state.bounty and (wave_state.bounty.killed or 0) or 0
         data.bounty_target = wave_state.bounty and (wave_state.bounty.target or 0) or 0
-        data.catastrophe_active = wave_state.catastrophe ~= nil
-        data.catastrophe_id = wave_state.catastrophe and wave_state.catastrophe.id or 0
-        data.catastrophe_tier = (wave_state.catastrophe_runtime and wave_state.catastrophe_runtime.tier) or 0
         data.challenge_active = wave_state.challenge and (wave_state.challenge.completed ~= true) or false
         data.challenge_progress = wave_state.challenge and (wave_state.challenge.progress or 0) or 0
         data.challenge_target = wave_state.challenge and (wave_state.challenge.target or 0) or 0
@@ -110,14 +105,6 @@ function M.Create(deps)
         return PickWaveRule()
     end
 
-    local function RollCatastrophe(day)
-        return CatastropheController.Roll(day)
-    end
-
-    local function BuildCatastropheRuntime(catastrophe, day)
-        return CatastropheController.BuildRuntime(catastrophe, day)
-    end
-
     local function GetRotationId(players)
         for _, p in ipairs(players or {}) do
             if p and p:IsValid() then
@@ -126,6 +113,17 @@ function M.Create(deps)
             end
         end
         return 1
+    end
+
+    -- 函数说明：根据存活玩家数量返回 Boss HP 缩放系数
+    -- 优化：独立的 HP 倍率曲线，多人时提供更大的生命值挑战
+    local function GetPlayerHPScale(count)
+        if count <= 1 then return 1.0
+        elseif count == 2 then return 1.6
+        elseif count == 3 then return 2.2
+        elseif count == 4 then return 2.8
+        end
+        return 3.3
     end
 
     -- 函数说明：根据天数、队伍生命状态与赛季轮换偏置计算当前波次危险阶梯。
@@ -384,29 +382,11 @@ function M.Create(deps)
         deps.Announce(player:GetDisplayName() .. " 完成通缉精英，领取了悬赏奖励！(危险阶梯" .. tostring(threat_tier) .. ")")
     end
 
-    local function ClearCatastropheEnvironment()
-        CatastropheController.ClearEnvironment(GetWorld(), wave_state)
-    end
-
-    local function ApplyCatastropheEnvironment(world, day)
-        wave_state.catastrophe_runtime = wave_state.catastrophe_runtime or BuildCatastropheRuntime(wave_state.catastrophe, day)
-        CatastropheController.ApplyEnvironment(world, wave_state, function() return wave_active end)
-    end
-
-    local function ApplyCatastropheEnemyBehavior(ent)
-        CatastropheController.ApplyEnemyBehavior(ent, wave_state, function() return wave_active end)
-    end
-
     local function EndWave()
         if not wave_active then return end
         wave_active = false
         local world = GetWorld()
-        ClearCatastropheEnvironment()
         if wave_task then wave_task:Cancel(); wave_task = nil end
-        if wave_state.catastrophe_task then
-            wave_state.catastrophe_task:Cancel()
-            wave_state.catastrophe_task = nil
-        end
         
         local day = world and world.state and (world.state.cycles + 1) or 1
         local is_rest_day = deps.Config.BOSS_INTERVAL > 1 and (day % deps.Config.BOSS_INTERVAL == deps.Config.BOSS_INTERVAL - 1)
@@ -414,6 +394,9 @@ function M.Create(deps)
         
         if is_rest_day then
             deps.Announce("休息天结束。好好准备迎接明天的战斗吧！")
+            if deps.Config.AI_NPC_ENABLED and world.components.rogue_ai_npc_manager then
+                world.components.rogue_ai_npc_manager:OnRestDayEnd()
+            end
         else
             deps.Announce("波次结束！今晚暂时安全了。")
         end
@@ -453,6 +436,20 @@ function M.Create(deps)
             end
         end
         if wave_state.route_runtime then
+            -- 清理路线效果
+            for _, p in ipairs(deps.CollectAlivePlayers()) do
+                if p and p:IsValid() then
+                    -- 移除移动速度提升
+                    if p.components and p.components.locomotor then
+                        p.components.locomotor:RemoveExternalSpeedMultiplier(p, "rogue_route_speed")
+                    end
+                    -- 移除生命恢复任务
+                    if p._rogue_route_regen_task then
+                        p._rogue_route_regen_task:Cancel()
+                        p._rogue_route_regen_task = nil
+                    end
+                end
+            end
             wave_state.route_runtime = nil
             wave_state.route_active = nil
             wave_state.route_pending_day = nil
@@ -466,8 +463,6 @@ function M.Create(deps)
         end
         wave_state.current_rule = nil
         wave_state.bounty = nil
-        wave_state.catastrophe = nil
-        wave_state.catastrophe_runtime = nil
         wave_state.challenge = nil
         SyncWaveStateToAllPlayers()
         if world and math.random() < 0.12 then
@@ -583,9 +578,9 @@ function M.Create(deps)
                         local hp = 0
                         if opts.trial_boss then
                             local step = math.floor((day - 1) / (deps.CONST.TRIAL_BOSS_HP_STEP_DAYS or 20))
-                            hp = (4500 + pc * 1500) * (deps.CONST.TRIAL_BOSS_HP_MULT or 0.78) * (1 + step * (deps.CONST.TRIAL_BOSS_HP_STEP_MULT or 0.12))
+                            hp = 4500 * GetPlayerHPScale(pc) * (deps.CONST.TRIAL_BOSS_HP_MULT or 0.78) * (1 + step * (deps.CONST.TRIAL_BOSS_HP_STEP_MULT or 0.12))
                         else
-                            hp = (4500 + pc * 1500) * (1 + math.floor((day - 1) / 30) * 0.2)
+                            hp = 4500 * GetPlayerHPScale(pc) * (1 + math.floor((day - 1) / 30) * 0.2)
                         end
                         ent.components.health:SetMaxHealth(hp)
                         if not opts.trial_boss and math.random() < 0.35 then
@@ -643,13 +638,6 @@ function M.Create(deps)
                             ent.components.health:SetMaxHealth(ent.components.health.maxhealth * hp_mult)
                         end
                     end
-                    if wave_state.catastrophe and not is_boss then
-                        local rt = wave_state.catastrophe_runtime
-                        local hp_mult = (wave_state.catastrophe.hp_mult or 1) * (rt and rt.enemy_hp_mult or 1)
-                        if hp_mult ~= 1 then
-                            ent.components.health:SetMaxHealth(ent.components.health.maxhealth * hp_mult)
-                        end
-                    end
                     if wave_state.threat_runtime and ent.components.health.maxhealth then
                         local hp_mult = wave_state.threat_runtime.hp_mult or 1
                         if hp_mult ~= 1 then
@@ -671,13 +659,6 @@ function M.Create(deps)
                             ent.components.combat:SetDefaultDamage(ent.components.combat.defaultdamage * dmg_mult)
                         end
                     end
-                    if wave_state.catastrophe and not is_boss and ent.components.combat.defaultdamage then
-                        local rt = wave_state.catastrophe_runtime
-                        local dmg_mult = (wave_state.catastrophe.dmg_mult or 1) * (rt and rt.enemy_dmg_mult or 1)
-                        if dmg_mult ~= 1 then
-                            ent.components.combat:SetDefaultDamage(ent.components.combat.defaultdamage * dmg_mult)
-                        end
-                    end
                     if wave_state.threat_runtime and ent.components.combat.defaultdamage then
                         local dmg_mult = wave_state.threat_runtime.dmg_mult or 1
                         if dmg_mult ~= 1 then
@@ -685,9 +666,6 @@ function M.Create(deps)
                         end
                     end
                     ent.components.combat:SetTarget(player)
-                end
-                if wave_state.catastrophe and not is_boss then
-                    ApplyCatastropheEnemyBehavior(ent)
                 end
             end
         end
@@ -725,8 +703,6 @@ function M.Create(deps)
         wave_state.threat_drop_bonus = (wave_state.threat_runtime and wave_state.threat_runtime.drop_bonus) or 0
         wave_state.current_rule = (is_boss_wave or is_rest_day) and nil or RollWaveRule(day)
         wave_state.bounty = (is_boss_wave or is_rest_day) and nil or PickWaveBounty(day, wave_state.threat_tier)
-        wave_state.catastrophe = (is_boss_wave or is_rest_day) and nil or RollCatastrophe(day)
-        wave_state.catastrophe_runtime = wave_state.catastrophe and BuildCatastropheRuntime(wave_state.catastrophe, day) or nil
         wave_state.challenge = is_rest_day and nil or PickChallengeForDay(day, wave_state.threat_tier)
         if wave_state.bounty or wave_state.challenge then
             for _, p in ipairs(deps.AllPlayers) do
@@ -741,18 +717,19 @@ function M.Create(deps)
                 end
             end
         end
-        if wave_state.catastrophe then
-            for _, p in ipairs(deps.AllPlayers) do
-                if p and p:IsValid() then
-                    local data = deps.EnsurePlayerData(p)
-                    data.season_catastrophe_days = (data.season_catastrophe_days or 0) + 1
-                end
-            end
-        end
         SyncWaveStateToAllPlayers()
         
         if is_rest_day then
             deps.Announce("第 " .. day .. " 天: 休息天！暴风雨前的宁静。今天没有敌人来袭。")
+            
+            -- AI NPC 刷新逻辑
+            if deps.Config.AI_NPC_ENABLED then
+                local current_world = GetWorld()
+                if current_world and current_world.components.rogue_ai_npc_manager then
+                    current_world.components.rogue_ai_npc_manager:TrySpawnNPC(day, players)
+                end
+            end
+            
             return
         end
         
@@ -772,6 +749,19 @@ function M.Create(deps)
                 if wave_state.route_runtime.hp_cost_pct and p.components and p.components.health then
                     p.components.health:DoDelta(-p.components.health.maxhealth * wave_state.route_runtime.hp_cost_pct, nil, "rogue_route_cost")
                 end
+                if wave_state.route_runtime.speed_bonus and p.components and p.components.locomotor then
+                    p.components.locomotor:SetExternalSpeedMultiplier(p, "rogue_route_speed", 1 + wave_state.route_runtime.speed_bonus)
+                end
+                if wave_state.route_runtime.regen_bonus and p.components and p.components.health then
+                    -- 生命恢复速度提升
+                    if not p._rogue_route_regen_task then
+                        p._rogue_route_regen_task = p:DoPeriodicTask(1, function()
+                            if p and p:IsValid() and p.components.health and not p.components.health:IsDead() then
+                                p.components.health:DoDelta(1 * wave_state.route_runtime.regen_bonus)
+                            end
+                        end)
+                    end
+                end
             end
         end
         if wave_state.current_rule then
@@ -779,25 +769,6 @@ function M.Create(deps)
         end
         if wave_state.bounty then
             deps.Announce("通缉精英：" .. tostring(wave_state.bounty.name) .. "，击杀 " .. tostring(wave_state.bounty.target) .. " 只后获得额外奖励！")
-        end
-        if wave_state.catastrophe then
-            deps.Announce("异变天灾：" .. wave_state.catastrophe.name .. "（" .. wave_state.catastrophe.desc .. "）")
-            if wave_state.catastrophe_runtime then
-                deps.Announce("天灾强度：" .. wave_state.catastrophe_runtime.tier_name)
-            end
-            ApplyCatastropheEnvironment(world, day)
-            if (wave_state.catastrophe_runtime and wave_state.catastrophe_runtime.sanity_drain or wave_state.catastrophe.sanity_drain or 0) > 0 then
-                wave_state.catastrophe_task = world:DoPeriodicTask(8, function()
-                    if not wave_active or not wave_state.catastrophe then return end
-                    for _, p in ipairs(deps.CollectAlivePlayers()) do
-                        if p.components.sanity then
-                            local rt = wave_state.catastrophe_runtime
-                            local drain = (rt and rt.sanity_drain) or wave_state.catastrophe.sanity_drain or 0
-                            p.components.sanity:DoDelta(-drain)
-                        end
-                    end
-                end)
-            end
         end
         if wave_state.challenge then
             deps.Announce("挑战房：" .. (deps.CHALLENGE_KIND_NAMES[wave_state.challenge.kind] or "未知挑战") .. " " .. wave_state.challenge.target .. " 次（危险阶梯" .. tostring(wave_state.threat_tier) .. "）")
@@ -835,9 +806,6 @@ function M.Create(deps)
                 if wave_state.current_rule and wave_state.current_rule.spawn_period_mult then
                     base_period = math.max(1.0, base_period * wave_state.current_rule.spawn_period_mult)
                 end
-                if wave_state.catastrophe and wave_state.catastrophe.spawn_period_mult then
-                    base_period = math.max(0.8, base_period * wave_state.catastrophe.spawn_period_mult)
-                end
                 if wave_state.threat_runtime and wave_state.threat_runtime.spawn_period_mult then
                     base_period = math.max(0.8, base_period * wave_state.threat_runtime.spawn_period_mult)
                 end
@@ -868,7 +836,7 @@ function M.Create(deps)
 
     S.GetState = function() return wave_state end
     S.RegisterRPCCallbacks = function()
-        deps.GLOBAL.rawset(deps.GLOBAL, "_rogue_mode_pick_route_rpc", function(player, slot)
+        local route_handler = function(player, slot)
             if not player or not player:IsValid() then return end
             local idx = tonumber(slot)
             if not idx or idx < 1 or idx > 2 then return end
@@ -891,7 +859,12 @@ function M.Create(deps)
                 local day = (GetWorld() and GetWorld().state and (GetWorld().state.cycles + 1)) or 1
                 ApplyRouteChoice(route, day)
             end
-        end)
+        end
+        if deps.SetRPCHandler then
+            deps.SetRPCHandler("pick_route", route_handler)
+        else
+            deps.GLOBAL.rawset(deps.GLOBAL, "_rogue_mode_pick_route_rpc", route_handler)
+        end
     end
     S.ExportState = function()
         local route_offer_ids = nil
@@ -906,7 +879,6 @@ function M.Create(deps)
             used_bosses = CloneTable(wave_state.used_bosses) or {},
             current_rule_id = wave_state.current_rule and wave_state.current_rule.id or 0,
             bounty = CloneTable(wave_state.bounty),
-            catastrophe_id = wave_state.catastrophe and wave_state.catastrophe.id or 0,
             challenge = CloneTable(wave_state.challenge),
             route_active_id = wave_state.route_active and wave_state.route_active.id or 0,
             route_pending_day = wave_state.route_pending_day or 0,
@@ -927,10 +899,6 @@ function M.Create(deps)
             wave_task:Cancel()
             wave_task = nil
         end
-        if wave_state.catastrophe_task then
-            wave_state.catastrophe_task:Cancel()
-            wave_state.catastrophe_task = nil
-        end
         if wave_state.route_vote_task then
             wave_state.route_vote_task:Cancel()
             wave_state.route_vote_task = nil
@@ -938,9 +906,6 @@ function M.Create(deps)
         wave_state.used_bosses = CloneTable(saved.used_bosses) or {}
         wave_state.current_rule = FindDefById(deps.WAVE_RULE_DEFS, saved.current_rule_id)
         wave_state.bounty = CloneTable(saved.bounty)
-        wave_state.catastrophe = FindDefById(deps.CATASTROPHE_DEFS, saved.catastrophe_id)
-        wave_state.catastrophe_runtime = nil
-        wave_state.catastrophe_env_task = nil
         wave_state.challenge = CloneTable(saved.challenge)
         wave_state.route_active = FindDefById(deps.REGION_ROUTE_DEFS, saved.route_active_id)
         wave_state.route_pending_day = (tonumber(saved.route_pending_day) or 0) > 0 and tonumber(saved.route_pending_day) or nil
