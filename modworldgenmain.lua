@@ -365,6 +365,7 @@ AddLevel(LEVELTYPE.SURVIVAL, {
     overrides = {
         task_set = "rogue_task_set", -- 指向我们的任务集
         world_size = "small", -- 回退到原始世界大小
+        layout_mode = "LinkNodesByKeys", -- [V2.3.1] 必须指定布局模式，否则专用服务器路径下世界生成 assert 失败
         keep_disconnected_tiles = false,
         no_wormholes_to_disconnected_tiles = true,
         no_joining_islands = true,
@@ -392,6 +393,7 @@ AddLevel(LEVELTYPE.SURVIVAL, {
         task_set = "rogue_sw_task_set",
         start_location = "rogue_sw_task",
         world_size = "small",
+        layout_mode = "LinkNodesByKeys", -- [V2.3.1] 必须指定布局模式，否则专用服务器路径下世界生成 assert 失败
         keep_disconnected_tiles = false,
         no_wormholes_to_disconnected_tiles = true,
         no_joining_islands = true,
@@ -418,6 +420,7 @@ AddLevel(LEVELTYPE.SURVIVAL, {
         task_set = "rogue_hamlet_task_set",
         start_location = "rogue_hamlet_task",
         world_size = "small",
+        layout_mode = "LinkNodesByKeys", -- [V2.3.1] 必须指定布局模式，否则专用服务器路径下世界生成 assert 失败
         keep_disconnected_tiles = false,
         no_wormholes_to_disconnected_tiles = true,
         no_joining_islands = true,

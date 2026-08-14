@@ -52,6 +52,17 @@ local RogueAchievement = require("rogue/achievement_system")
 local RogueCoopSystem = require("rogue/coop_system")
 local RogueMilestoneSystem = require("rogue/milestone_system")
 local RogueConfigHotreload = require("rogue/config_hotreload")
+
+-- 预声明：连锁任务奖励等系统需要在运行期回调遗物/天赋选择，
+-- 此处先声明变量槽，待对应系统创建完成后赋值（见下方函数定义处）。
+local OfferRelicChoice = nil
+-- 预声明：world 生命周期回调（AddPrefabPostInit）在运行期才执行，
+-- 需要引用创建顺序靠后的系统实例，同样先声明变量槽。
+local EnvSystem = nil
+local CoopSystem = nil
+local ComboSystem = nil
+local MilestoneSystem = nil
+
 local Config = RogueConfig.LoadConfig(function(key)
     return GetModConfigData(key)
 end)
@@ -137,7 +148,8 @@ local containers = require("containers")
 local params = containers.params
 
 local rogue_recycle_bin_slots = {}
-for y = 0, 2 do
+-- [V2.3.3] 回收容器扩充为 5x5 = 25 格
+for y = 0, 4 do
     for x = 0, 4 do
         table.insert(rogue_recycle_bin_slots, GLOBAL.Vector3(-250 + x * 120, 60 - y * 90, 0))
     end
@@ -166,6 +178,8 @@ end)
 -- [RPC闭包注册] --------------------------------------------------------------------
 -- 使用本地handler表替代GLOBAL全局函数桥接，避免命名空间污染
 -- handler表在子系统初始化后填充，RPC回调通过闭包引用此表
+-- 注册统一走 rpc_registry（集中管理 + 客户端合并窗口机制）
+local RPCRegistry = require("rogue/rpc_registry")
 local _rpc_handlers = {}
 
 -- 函数说明：注册RPC处理器到本地表（替代GLOBAL._rogue_mode_*_rpc赋值）
@@ -183,17 +197,18 @@ local function MakeRPCCallback(name)
     end
 end
 
-AddModRPCHandler("rogue_mode", "pick_talent", MakeRPCCallback("pick_talent"))
-AddModRPCHandler("rogue_mode", "pick_supply", MakeRPCCallback("pick_supply"))
-AddModRPCHandler("rogue_mode", "pick_relic", MakeRPCCallback("pick_relic"))
-AddModRPCHandler("rogue_mode", "pick_route", MakeRPCCallback("pick_route"))
-AddModRPCHandler("rogue_mode", "buy_shop_item", MakeRPCCallback("buy_shop_item"))
-AddModRPCHandler("rogue_mode", "buy_black_market_item", MakeRPCCallback("buy_black_market_item"))
-AddModRPCHandler("rogue_mode", "recycle_item", MakeRPCCallback("recycle_item"))
-AddModRPCHandler("rogue_mode", "open_recycle_bin", MakeRPCCallback("open_recycle_bin"))
-AddModRPCHandler("rogue_mode", "close_recycle_bin", MakeRPCCallback("close_recycle_bin"))
-AddModRPCHandler("rogue_mode", "recycle_all_items", MakeRPCCallback("recycle_all_items"))
-AddModRPCHandler("rogue_mode", "reload_config", MakeRPCCallback("reload_config"))
+RPCRegistry.Register("pick_talent", MakeRPCCallback("pick_talent"))
+RPCRegistry.Register("pick_supply", MakeRPCCallback("pick_supply"))
+RPCRegistry.Register("pick_relic", MakeRPCCallback("pick_relic"))
+RPCRegistry.Register("pick_route", MakeRPCCallback("pick_route"))
+RPCRegistry.Register("buy_shop_item", MakeRPCCallback("buy_shop_item"))
+RPCRegistry.Register("buy_black_market_item", MakeRPCCallback("buy_black_market_item"))
+RPCRegistry.Register("recycle_item", MakeRPCCallback("recycle_item"))
+RPCRegistry.Register("open_recycle_bin", MakeRPCCallback("open_recycle_bin"))
+RPCRegistry.Register("close_recycle_bin", MakeRPCCallback("close_recycle_bin"))
+RPCRegistry.Register("recycle_all_items", MakeRPCCallback("recycle_all_items"))
+RPCRegistry.Register("reload_config", MakeRPCCallback("reload_config"))
+RPCRegistry.Register("combo_skill", MakeRPCCallback("combo_skill"))
 
 if RemapSoundEvent then
     RemapSoundEvent("rifts4/rabbit_king/aggressive/spawn_pst", "dontstarve/common/dropGeneric")
@@ -228,7 +243,15 @@ local function IsRogueAffixCandidatePrefab(prefab)
     return prefab ~= nil and ROGUE_AFFIX_PREFAB_WHITELIST[prefab] == true
 end
 
+-- 按名称排序后注册，保证客户端/服务器以完全一致的顺序创建网络变量，
+-- 避免 Lua table pairs 遍历顺序不确定性导致后续网络变量错位崩溃。
+local affix_prefab_names = {}
 for prefab_name, _ in pairs(ROGUE_AFFIX_PREFAB_WHITELIST) do
+    table.insert(affix_prefab_names, prefab_name)
+end
+table.sort(affix_prefab_names)
+
+for _, prefab_name in ipairs(affix_prefab_names) do
     AddPrefabPostInit(prefab_name, function(inst)
         if not inst._rogue_affix_nettext then
             inst._rogue_affix_nettext = GLOBAL.net_string(inst.GUID, "rogue_affix_nettext", "roguedirty")
@@ -278,6 +301,10 @@ end
 local BUFF_TYPES = RogueConfig.BUFF_TYPES
 local TALENT_DEFS = RogueConfig.TALENT_DEFS
 local DAILY_KIND_NAMES = RogueConfig.DAILY_KIND_NAMES
+local DAILY_TASK_TARGETS = RogueConfig.DAILY_TASK_TARGETS
+local DAILY_SPECIFIC_TARGET_DEFS = RogueConfig.DAILY_SPECIFIC_TARGET_DEFS
+local DAILY_CHAIN_DEFS = RogueConfig.DAILY_CHAIN_DEFS
+local DAILY_TASK_REWARDS = RogueConfig.DAILY_TASK_REWARDS
 local WAVE_RULE_DEFS = RogueConfig.WAVE_RULE_DEFS
 local REGION_ROUTE_DEFS = RogueConfig.REGION_ROUTE_DEFS
 local SUPPLY_DEFS = RogueConfig.SUPPLY_DEFS
@@ -377,6 +404,55 @@ AddPrefabPostInit("world", function(inst)
     end
 
     inst:AddComponent("rogue_ai_npc_manager")
+
+    -- [V2.3] 环境词缀过期检查：每秒驱动一次（环境词缀生命周期管理）
+    -- pcall 防护：定时器内单点错误不允许影响世界模拟
+    if EnvSystem and EnvSystem.OnUpdate then
+        inst:DoPeriodicTask(1, function()
+            local ok, err = pcall(EnvSystem.OnUpdate)
+            if not ok and Config.DEBUG_MODE then
+                print("[Rogue][EnvSystem] OnUpdate error: " .. tostring(err))
+            end
+        end)
+    end
+
+    -- [V2.3] 多人协作系统：近距离增益刷新/守护据点事件推进/自动救援（2秒周期）
+    -- pcall 防护：定时器内单点错误不允许影响世界模拟
+    if CoopSystem then
+        inst:DoPeriodicTask(2, function()
+            local ok, err = pcall(function()
+                if not CoopSystem.RefreshCoopBuffs then return end
+                CoopSystem.RefreshCoopBuffs()
+                if CoopSystem.UpdateCoopEvents then
+                    CoopSystem.UpdateCoopEvents(inst, inst.state and inst.state.isday == true)
+                end
+                -- 自动救援：鬼魂玩家附近有存活队友时，队友自动支付生命复活（90秒间隔）
+                local now = GetTime()
+                for _, p in ipairs(AllPlayers) do
+                    if p and p:IsValid() and p:HasTag("playerghost") and p.rogue_data then
+                        local last = p.rogue_data._coop_auto_revive_last or 0
+                        if now - last >= 90 then
+                            local px, py, pz = p.Transform:GetWorldPosition()
+                            local nearby = GLOBAL.TheSim:FindEntities(px, py, pz, 10, {"player"}, {"playerghost", "INLIMBO"})
+                            for _, ally in ipairs(nearby) do
+                                if ally ~= p and ally:IsValid() and not ally:HasTag("playerghost") and ally.rogue_data then
+                                    local ok_revive = CoopSystem.TryReviveAlly and CoopSystem.TryReviveAlly(ally, p)
+                                    if ok_revive then
+                                        p.rogue_data._coop_auto_revive_last = now
+                                        Announce(ally:GetDisplayName() .. " 救援了 " .. p:GetDisplayName() .. "！")
+                                    end
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+            if not ok and Config.DEBUG_MODE then
+                print("[Rogue][CoopSystem] tick error: " .. tostring(err))
+            end
+        end)
+    end
 
     if inst.components.wagpunk_arena_manager then
         inst.components.wagpunk_arena_manager.OnInit = function() end
@@ -521,11 +597,29 @@ local function SafeFindEntities(x, y, z, radius, tags, excludetags)
     return RogueHelpers.SafeFindEntities(x, y, z, radius, tags, excludetags)
 end
 
+-- 环境/全局词缀系统（V2.3 接线）：需要先于所有消费方创建
+local AffixEnvironment = require("rogue/affix_environment")
+EnvSystem = AffixEnvironment.Create({
+    SpawnPrefab = SpawnPrefab,
+    GetTime = GetTime,
+    Announce = Announce,
+})
+
+-- 函数说明：读取当前激活的全局词缀修正值（world.rogue_env_data），供各系统消费
+local function GetGlobalModifier(key)
+    if EnvSystem and EnvSystem.GetGlobalModifier then
+        return EnvSystem.GetGlobalModifier(key)
+    end
+    return nil
+end
+
 local AffixSystem = RogueAffixSystem.Create({
     Config = Config,
     CONST = CONST,
     ELITE_AFFIX_DEFS = ELITE_AFFIX_DEFS,
     AFFIX_CONFLICTS = AFFIX_CONFLICTS,
+    BOSS_AFFIX_DEFS = RogueConfig.BOSS_AFFIX_DEFS,
+    GetGlobalModifier = GetGlobalModifier,
     BossMechanics = RogueBossMechanics.Create({
         BOSS_TEMPLATE_DEFS = BOSS_TEMPLATE_DEFS,
         BOSS_TEMPLATE_ROTATION_MODS = BOSS_TEMPLATE_ROTATION_MODS,
@@ -583,12 +677,13 @@ local DropSystem = RogueDropSystem.Create({
     EnsurePlayerData = EnsurePlayerData,
     IsValidPlayer = IsValidPlayer,
     BUFF_TYPES = BUFF_TYPES,
-    GEAR_BUFFS = GEAR_BUFFS,
     SEASON_AFFIX_ROTATION_DEFS = SEASON_AFFIX_ROTATION_DEFS,
     BOSS_LOOT_SIGNATURE_DEFS = BOSS_LOOT_SIGNATURE_DEFS,
     SEASON_OBJECTIVE_DEFS = SEASON_OBJECTIVE_DEFS,
     DROP_PITY_RULES = DROP_PITY_RULES,
     VNEXT_DROP_BALANCE = VNEXT_DROP_BALANCE,
+    GetGlobalModifier = GetGlobalModifier,
+    BossBalance = RogueConfig.BOSS_BALANCE,
     SyncGrowthNetvars = SyncGrowthNetvars,
     CONST = CONST,
     Announce = Announce,
@@ -631,6 +726,8 @@ local TalentSupply = RogueTalentSupply.Create({
     PoolCatalog = PoolCatalog,
     PickWeightedCandidate = PickWeightedCandidate,
     SpawnDrop = SpawnDrop,
+    SpawnPrefab = SpawnPrefab,
+    GetTime = GetTime,
     Announce = Announce,
     GetCurrentDay = function() return GLOBAL.TheWorld.state.cycles + 1 end,
     SetRPCHandler = SetRPCHandler,
@@ -647,6 +744,11 @@ local ProgressionSystem = RogueProgressionSystem.Create({
     DAILY_TASK_KIND_WEIGHTS = DAILY_TASK_KIND_WEIGHTS,
     DAILY_TASK_ROTATION_MODS = DAILY_TASK_ROTATION_MODS,
     DAILY_REWARD_RULES = DAILY_REWARD_RULES,
+    DAILY_TASK_TARGETS = DAILY_TASK_TARGETS,
+    DAILY_SPECIFIC_TARGET_DEFS = DAILY_SPECIFIC_TARGET_DEFS,
+    DAILY_CHAIN_DEFS = DAILY_CHAIN_DEFS,
+    DAILY_TASK_REWARDS = DAILY_TASK_REWARDS,
+    GetGlobalModifier = GetGlobalModifier,
     EnsurePlayerData = EnsurePlayerData,
     SyncGrowthNetvars = SyncGrowthNetvars,
     IsValidPlayer = IsValidPlayer,
@@ -656,10 +758,23 @@ local ProgressionSystem = RogueProgressionSystem.Create({
     SpawnDrop = SpawnDrop,
     Announce = Announce,
     GetTime = GetTime,
+    -- 连锁任务奖励兑现：闭包运行期取最新赋值，避免创建顺序导致的 nil
+    OfferRelicChoice = function(player, source, day)
+        if OfferRelicChoice then return OfferRelicChoice(player, source, day) end
+    end,
+    OfferTalentChoice = function(player)
+        if TalentSupply and TalentSupply.OfferTalentChoice then
+            return TalentSupply.OfferTalentChoice(player)
+        end
+    end,
 })
 
 local function ResetComboState(player)
-    return ProgressionSystem.ResetComboState(player)
+    ProgressionSystem.ResetComboState(player)
+    -- [V2.3] 连击重置时同步重置连击里程碑状态
+    if ComboSystem and ComboSystem.OnComboExpired and player and player.rogue_data then
+        ComboSystem.OnComboExpired(player, player.rogue_data)
+    end
 end
 
 local function RefreshComboState(player)
@@ -690,6 +805,19 @@ local function CheckTalentTrigger(player)
     return TalentSupply.CheckTalentTrigger(player)
 end
 
+-- [V2.3] 连击技能系统：里程碑/技能/冷却管理（连击计数沿用 ProgressionSystem）
+local RogueComboSystem = require("rogue/combo_system")
+ComboSystem = RogueComboSystem.Create({
+    GetTime = GetTime,
+    ApplyGrowthState = ApplyGrowthState,
+    EnsurePlayerData = EnsurePlayerData,
+    Announce = Announce,
+    SpawnPrefab = SpawnPrefab,
+    GetGlobalModifier = GetGlobalModifier,
+    SetRPCHandler = SetRPCHandler,
+})
+ComboSystem.RegisterRPCCallbacks()
+
 local function ReapplyTalentEffects(player)
     return TalentSupply.ReapplyTalentEffects(player)
 end
@@ -710,7 +838,7 @@ local function OfferInitialRelicChoice(player)
     return RelicSystem.OfferInitialRelicChoice(player)
 end
 
-local function OfferRelicChoice(player, source, day)
+function OfferRelicChoice(player, source, day)
     return RelicSystem.OfferRelicChoice(player, source, day)
 end
 
@@ -768,6 +896,7 @@ local SeasonResultSystem = RogueSeasonResult.Create({
     SpawnDrop = function(victim, prefab, buffs)
         return DropSystem and DropSystem.SpawnDrop and DropSystem.SpawnDrop(victim, prefab, buffs) or nil
     end,
+    REGION_ROUTE_DEFS = REGION_ROUTE_DEFS,
 })
 
 SeasonSystem = RogueSeasonSystem.Create({
@@ -781,8 +910,24 @@ SeasonSystem = RogueSeasonSystem.Create({
     GetCurrentDay = function() return GLOBAL.TheWorld.state.cycles + 1 end,
     GetTime = GetTime,
     RequestWorldReset = RequestWorldReset,
-    OnSeasonChanged = function() SeasonResultSystem.OnSeasonChanged() end,
-    FinalizeSeason = function(day) return SeasonResultSystem.Finalize(day) end,
+    OnSeasonChanged = function(season_id)
+        SeasonResultSystem.OnSeasonChanged()
+        -- [V2.3] 新赛季开始时抽取全局词缀（赛季级效果，2个）
+        if EnvSystem and EnvSystem.SelectGlobalAffixes then
+            EnvSystem.SelectGlobalAffixes((GLOBAL.TheWorld and GLOBAL.TheWorld.state.cycles + 1) or 1, 2)
+        end
+        -- [V2.3] 新赛季重置里程碑领取状态
+        if MilestoneSystem and MilestoneSystem.ResetMilestones then
+            MilestoneSystem.ResetMilestones()
+        end
+    end,
+    FinalizeSeason = function(day)
+        -- [V2.3] 赛季结算时清除全部环境/全局词缀
+        if EnvSystem and EnvSystem.ClearAll then
+            EnvSystem.ClearAll()
+        end
+        return SeasonResultSystem.Finalize(day)
+    end,
     Announce = Announce,
 })
 
@@ -865,6 +1010,7 @@ local WaveSystem = RogueWaveSystem.Create({
     CHALLENGE_KIND_NAMES = CHALLENGE_KIND_NAMES,
     EnsurePlayerData = EnsurePlayerData,
     SyncGrowthNetvars = SyncGrowthNetvars,
+    GetGlobalModifier = GetGlobalModifier,
     PickWeightedCandidate = PickWeightedCandidate,
     ResolveRuntimePrefab = ResolveRuntimePrefab,
     IsPrefabRegistered = IsPrefabRegistered,
@@ -963,6 +1109,7 @@ local ShopSystem = RogueShopSystem.Create({
     Announce = Announce,
     DropSystem = DropSystem,
     IsMasterSim = function() return GLOBAL.TheWorld and GLOBAL.TheWorld.ismastersim end,
+    GetCurrentDay = function() return GLOBAL.TheWorld.state.cycles + 1 end,
     AddComponentPostInit = AddComponentPostInit,
 })
 -- 注册升级属性持久化钩子：确保武器/护甲/装备的强化数据在存档加载时自动恢复
@@ -1038,6 +1185,20 @@ local RuntimeSystem = RogueRuntimeSystem.Create({
     DropLoot = DropLoot,
     RefreshComboState = RefreshComboState,
     ProgressDailyTaskOnKill = ProgressDailyTaskOnKill,
+    ProgressDailyTaskOnCombo = function(player, combo_count, day)
+        -- [V2.3] 连击里程碑检查（冲击波/无敌等自动奖励）
+        if ComboSystem and ComboSystem.CheckMilestone and player and player.rogue_data then
+            ComboSystem.CheckMilestone(player, player.rogue_data)
+        end
+        return ProgressionSystem.ProgressDailyTaskOnCombo(player, combo_count, day)
+    end,
+    GetGlobalModifier = GetGlobalModifier,
+    ProgressDailyTaskOnCollect = function(player, amount, day)
+        return ProgressionSystem.ProgressDailyTaskOnCollect(player, amount, day)
+    end,
+    MarkDailyTaskDamageTaken = function(player)
+        return ProgressionSystem.MarkDailyTaskDamageTaken(player)
+    end,
     ProgressChallenge = ProgressChallenge,
     RewardBounty = RewardBounty,
     OnSeasonKill = OnSeasonKill,
@@ -1064,6 +1225,14 @@ local RuntimeSystem = RogueRuntimeSystem.Create({
     ImportSeasonState = ImportSeasonState,
     ExportDropState = ExportDropState,
     ImportDropState = ImportDropState,
+    ExportMilestoneState = function()
+        return MilestoneSystem and MilestoneSystem.ExportState and MilestoneSystem.ExportState() or nil
+    end,
+    ImportMilestoneState = function(saved)
+        if MilestoneSystem and MilestoneSystem.ImportState then
+            MilestoneSystem.ImportState(saved)
+        end
+    end,
     StartWave = StartWave,
     EndWave = EndWave,
     CollectAlivePlayers = CollectAlivePlayers,
@@ -1074,7 +1243,7 @@ RuntimeSystem.RegisterWorldLifecycle()
 
 -- [多人协作系统] --------------------------------------------------------------------
 
-local CoopSystem = RogueCoopSystem.Create({
+CoopSystem = RogueCoopSystem.Create({
     COOP_BUFF_DEFS = COOP_BUFF_DEFS,
     COOP_REVIVE_COST = COOP_REVIVE_COST,
     COOP_EVENT_DEFS = COOP_EVENT_DEFS,
@@ -1098,7 +1267,7 @@ local CoopSystem = RogueCoopSystem.Create({
 
 -- [赛季里程碑系统] --------------------------------------------------------------------
 
-local MilestoneSystem = RogueMilestoneSystem.Create({
+MilestoneSystem = RogueMilestoneSystem.Create({
     SEASON_MILESTONE_DEFS = SEASON_MILESTONE_DEFS,
     SEASON_MILESTONE_UNLOCK_METRICS = SEASON_MILESTONE_UNLOCK_METRICS,
     EnsurePlayerData = EnsurePlayerData,
@@ -1114,6 +1283,7 @@ local MilestoneSystem = RogueMilestoneSystem.Create({
     SafeFindEntities = SafeFindEntities,
     CollectAlivePlayers = CollectAlivePlayers,
     GrantRelicChoice = OfferRelicChoice,
+    GetCurrentDay = function() return GLOBAL.TheWorld.state.cycles + 1 end,
 })
 
 -- [配置热更新系统] --------------------------------------------------------------------
@@ -1136,5 +1306,52 @@ SetRPCHandler("reload_config", function(player)
         if player.components.talker then
             player.components.talker:Say("配置已热更新！变更 " .. tostring(count or 0) .. " 项")
         end
+    end
+end)
+
+-- [事件总线订阅] --------------------------------------------------------------------
+-- 集中订阅各系统通过 EventBus 发布的事件，驱动日常任务/里程碑进度钩子。
+-- 订阅放在所有系统创建之后，闭包运行期读取最新的系统实例引用。
+local RogueEventBus = require("rogue/event_bus")
+
+local function CurrentRogueDay()
+    return (GLOBAL.TheWorld and GLOBAL.TheWorld.state.cycles + 1) or 1
+end
+
+-- 天赋觉醒类日常任务（kind=12）
+RogueEventBus.Subscribe("on_talent_select", function(data)
+    if data and data.player and data.player:IsValid() then
+        ProgressionSystem.ProgressDailyTaskOnTalentPick(data.player, CurrentRogueDay())
+    end
+end)
+
+-- 遗物收集类日常任务（kind=11）
+RogueEventBus.Subscribe("on_relic_pickup", function(data)
+    if data and data.player and data.player:IsValid() then
+        ProgressionSystem.ProgressDailyTaskOnRelicPick(data.player, CurrentRogueDay())
+    end
+end)
+
+-- 连击技能类日常任务（kind=13）
+RogueEventBus.Subscribe("on_combo_skill", function(data)
+    if data and data.player and data.player:IsValid() then
+        ProgressionSystem.ProgressDailyTaskOnComboSkill(data.player, CurrentRogueDay())
+    end
+end)
+
+-- 存活天数类日常任务（kind=9）与赛季里程碑每日检查
+RogueEventBus.Subscribe("on_day_changed", function(data)
+    local new_day = (data and data.new_day) or CurrentRogueDay()
+    for _, player in ipairs(AllPlayers) do
+        if player and player:IsValid() and not player:HasTag("playerghost") then
+            ProgressionSystem.ProgressDailyTaskOnDayChange(player, new_day)
+        end
+    end
+    -- [V2.3] 环境词缀：每天白天有概率触发（含概率与冷却控制）
+    if EnvSystem and EnvSystem.TriggerRandomEnvAffix then
+        EnvSystem.TriggerRandomEnvAffix(new_day)
+    end
+    if MilestoneSystem and MilestoneSystem.CheckMilestones then
+        MilestoneSystem.CheckMilestones(new_day)
     end
 end)

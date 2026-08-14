@@ -6,7 +6,7 @@
 name = "肉鸽生存模式"
 description = "一个肉鸽挑战模式，玩家将在一个资源匮乏的小岛上抵御一波又一波的敌人。"
 author = "liuan"
-version = "2.1.1"
+version = "2.3.6"
 forumthread = ""
 api_version = 10
 dst_compatible = true
@@ -287,6 +287,18 @@ configuration_options = {
         default = 70,
     },
     
+    -- [调试]
+    {
+        name = "DEBUG_MODE",
+        label = "调试日志",
+        hover = "开启后将输出肉鸽模式分级调试日志，便于排查问题或反馈Bug。",
+        options = {
+            {description = "关闭", data = false},
+            {description = "开启", data = true},
+        },
+        default = false,
+    },
+
     -- [AI NPC]
     {
         name = "AI_NPC_ENABLED",
